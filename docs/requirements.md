@@ -19,6 +19,13 @@ Numbering scheme: `R<section><index>`, where `<section>` is a two-digit section 
   3. Move all existing repository contents (including `.git`) into that directory.
   4. Write [`subtree_config.json`](schemas/subtree_config.md) at the root.
   5. Create the initial sublime-project file at `sublime_projects/<repository_name>_<current-branch>.sublime-project` (see [Sublime project schema](schemas/sublime_project.md)).
+- **R020004** — When invoked from a Sublime window, `init` operates on the first folder opened in that window (`window.folders()[0]`). It errors if no folder is open.
+- **R020005** — `init` prompts the user for the [repository name](glossary.md#repository-name) via an input panel pre-filled with the target directory's basename. The user may accept or modify the value.
+- **R020006** — The [repository name](glossary.md#repository-name) must be non-empty and must not contain `/`, `\`, or control characters; it is used as a filename component.
+- **R020007** — `init` aborts without modification if [`subtree_config.json`](schemas/subtree_config.md) already exists at the target.
+- **R020008** — `init` aborts without modification if `worktrees/` or `sublime_projects/` already exists at the target (reserved-name collision).
+- **R020009** — `init` aborts without modification if HEAD is detached (no current branch name). The user must check out a branch before running `init`.
+- **R020010** — After successful `init`, Subtree opens the newly created [sublime-project file](schemas/sublime_project.md) and closes the originating window.
 
 ## 3. Create operation
 
