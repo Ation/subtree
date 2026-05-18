@@ -381,6 +381,31 @@ def _filter_openable(candidates, existing_worktree_names, local_branch_names):
     return result
 
 
+def _identify_current_worktree(folder, root, config):
+    """R050005: return the name of the worktree containing `folder`, or None.
+
+    Matches the longest `worktrees[].name` whose `worktrees/<name>/` directory
+    is a prefix of (or equal to) `folder`. Branch names with `/` segments are
+    matched as path components, so a branch `feature/foo` is preferred over
+    a branch `feature` when the folder lives under `worktrees/feature/foo/`.
+    """
+    worktrees_root = os.path.join(root, WORKTREES_DIRNAME)
+    try:
+        rel = os.path.relpath(os.path.abspath(folder), worktrees_root)
+    except ValueError:
+        return None
+    if rel == "." or rel.startswith(".."):
+        return None
+    rel_parts = rel.split(os.sep)
+    names = [wt["name"] for wt in config["worktrees"]]
+    # Try the longest names first so 'feature/foo' beats 'feature' when both exist.
+    for name in sorted(names, key=lambda n: -len(n.split("/"))):
+        name_parts = name.split("/")
+        if len(rel_parts) >= len(name_parts) and rel_parts[:len(name_parts)] == name_parts:
+            return name
+    return None
+
+
 def _open_project_and_close(window, project_path, op_label):
     """Open `project_path` via `subl --project` and close `window` (R020010 / R030019)."""
     try:
@@ -761,6 +786,72 @@ class SubtreeOpenCommand(sublime_plugin.WindowCommand):
         sublime.set_timeout(
             lambda: _open_project_and_close(self.window, new_project_path, "Open"), 0
         )
+
+
+class SubtreeSwitchCommand(sublime_plugin.WindowCommand):
+    def run(self):
+        # R050001: must have a folder open.
+        folders = self.window.folders()
+        if not folders:
+            sublime.error_message(
+                "Subtree: Switch requires a folder open in the window (R050001)."
+            )
+            return
+
+        # R050002 / R050003: locate root.
+        root = _find_root(folders[0])
+        if root is None:
+            sublime.error_message(
+                "Subtree: No {} found at or above {} (R050003).".format(
+                    CONFIG_FILENAME, folders[0]
+                )
+            )
+            return
+
+        # R050004: read + validate config.
+        try:
+            config = _read_config(root)
+        except (OSError, ValueError) as e:
+            sublime.error_message("Subtree: {} (R050004)".format(e))
+            return
+
+        # R050005: identify the current worktree (may be None).
+        current = _identify_current_worktree(folders[0], root, config)
+
+        # R050006: build the candidate list, excluding the current worktree.
+        candidates = [wt for wt in config["worktrees"] if wt["name"] != current]
+        if not candidates:
+            sublime.error_message(
+                "Subtree: No other worktrees to switch to "
+                "(only the current worktree is managed) (R050006)."
+            )
+            return
+
+        names = [wt["name"] for wt in candidates]
+        self.window.show_quick_panel(
+            names,
+            lambda idx: self._on_picked(root, candidates, idx),
+            placeholder="Pick worktree to switch to",
+        )
+
+    def _on_picked(self, root, candidates, idx):
+        if idx < 0:
+            return  # R050007: user dismissed.
+
+        entry = candidates[idx]
+        project_path = os.path.join(
+            root, SUBLIME_PROJECTS_DIRNAME, entry["project_file"]
+        )
+
+        # R050008: project file must exist.
+        if not os.path.isfile(project_path):
+            sublime.error_message(
+                "Subtree: Sublime-project file missing: {} (R050008).".format(project_path)
+            )
+            return
+
+        # R050009: open the new project and close this window.
+        _open_project_and_close(self.window, project_path, "Switch")
 
 
 class SubtreeRemoveCommand(sublime_plugin.WindowCommand):

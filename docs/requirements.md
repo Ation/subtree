@@ -76,6 +76,18 @@ Numbering scheme: `R<section><index>`, where `<section>` is a two-digit section 
 - **R040019** — After a successful `open`, Subtree opens the new sublime-project file and closes the originating window (mirroring [R020010](#2-init-operation) / [R030019](#3-create-operation)).
 - **R040020** — If `git worktree add` fails, `open` surfaces git's stderr to the user and writes neither the new sublime-project file nor the config entry. Any partial directory created by git is left on disk for manual inspection.
 
-## 5. Remove operation
+## 5. Switch operation
+
+- **R050001** — `switch` may only run from a Sublime window that has a folder open; it operates on `window.folders()[0]`. It errors if no folder is open.
+- **R050002** — `switch` locates the [root directory](glossary.md#root-directory) by walking upward from the operating folder until it finds a directory containing [`subtree_config.json`](schemas/subtree_config.md) (same algorithm as [R030002](#3-create-operation)).
+- **R050003** — `switch` aborts without modification if no `subtree_config.json` is found.
+- **R050004** — `switch` aborts without modification if `subtree_config.json` cannot be parsed as JSON matching the [Subtree config schema](schemas/subtree_config.md).
+- **R050005** — `switch` identifies the **current worktree** as the entry in `worktrees[]` whose `<root>/worktrees/<name>/` directory is an ancestor (or equal) of the operating folder. The deepest match wins, so a branch named `feature/foo` is matched in preference to a branch named `feature`. If no entry matches, the current worktree is undefined and no entry is excluded from the panel.
+- **R050006** — `switch` presents a quick panel listing every entry in `worktrees[].name` **except the current worktree** (R050005). If the resulting list is empty, `switch` aborts with a message explaining there is no other worktree to switch to.
+- **R050007** — `switch` aborts without modification if the user dismisses the quick panel.
+- **R050008** — `switch` aborts without modification if the picked entry's [sublime-project file](schemas/sublime_project.md) does not exist on disk at `<root>/sublime_projects/<project_file>`.
+- **R050009** — `switch` opens the picked sublime-project file and closes the originating window (mirroring [R020010](#2-init-operation) / [R030019](#3-create-operation) / [R040019](#4-open-operation)).
+
+## 6. Remove operation
 
 *To be specified.*
