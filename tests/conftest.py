@@ -15,6 +15,7 @@ def _install_sublime_stubs():
         sublime.status_message = lambda msg: None
         sublime.set_timeout = lambda fn, delay=0: fn()
         sublime.set_timeout_async = lambda fn, delay=0: fn()
+        sublime.ok_cancel_dialog = lambda msg, ok_title="OK": False
         sys.modules["sublime"] = sublime
 
     if "sublime_plugin" not in sys.modules:

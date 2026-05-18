@@ -2,7 +2,7 @@
 
 A Sublime Text plugin for managing git worktrees and projects.
 
-> Status: early scaffold. `Init`, `Create`, `Open`, and `Switch` are implemented; `Remove` is a stub.
+> Status: `Init`, `Create`, `Open`, `Switch`, and `Remove` are all implemented.
 
 ## Documentation
 
@@ -16,7 +16,7 @@ All commands are available from the Command Palette (`Ctrl+Shift+P` / `Cmd+Shift
 - **Subtree: Create** — create a new worktree from a selected existing worktree; prompts for the new branch name and creates the branch if it doesn't exist locally, otherwise checks it out
 - **Subtree: Open** — materialize an existing branch as a new worktree; lists local and remote branches that don't already have a worktree, creates a tracking branch when picking a remote (with the remote prefix stripped), and copies a chosen worktree's project file as the template
 - **Subtree: Switch** — switch to another existing worktree; lists all worktrees from `subtree_config.json` (excluding the current one) and opens the picked worktree's project file
-- **Subtree: Remove** — remove a worktree
+- **Subtree: Remove** — remove a worktree from a picker (the main worktree is excluded). Pre-checks for uncommitted changes, no-upstream branches with commits at risk, and ahead-of-upstream commits all gate the operation; pipenv environments are cleaned up if `pipenv` is on PATH. Removal calls `git worktree remove`, deletes the corresponding sublime-project file, and updates `subtree_config.json`.
 
 ## Installation
 

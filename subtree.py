@@ -381,6 +381,182 @@ def _filter_openable(candidates, existing_worktree_names, local_branch_names):
     return result
 
 
+def _check_uncommitted_changes(worktree_dir):
+    """R060008. Run `git status --porcelain`. Return error message or None.
+
+    Catches modified tracked files, staged changes, and untracked
+    non-`.gitignore`d files. Ignored files are not flagged.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "-C", worktree_dir, "status", "--porcelain"],
+            capture_output=True, text=True,
+        )
+    except FileNotFoundError:
+        return "`git` was not found on PATH."
+    if result.returncode != 0:
+        return "git status failed: " + (result.stderr.strip() or "unknown error")
+    if result.stdout.strip():
+        return "Worktree has uncommitted changes:\n" + result.stdout.rstrip()
+    return None
+
+
+def _check_upstream(worktree_dir):
+    """R060009 / R060010. Inspect upstream tracking of the current branch.
+
+    Returns one of:
+      {"status": "ok"}                                      -- no warning needed
+      {"status": "ahead", "ahead_count": int}               -- ahead of upstream
+      {"status": "no_upstream", "has_unique_commits": bool} -- no upstream set
+    """
+    # Probe upstream existence.
+    upstream = subprocess.run(
+        ["git", "-C", worktree_dir, "rev-parse", "--abbrev-ref",
+         "--symbolic-full-name", "@{u}"],
+        capture_output=True, text=True,
+    )
+    if upstream.returncode != 0:
+        # No upstream. Check whether HEAD has any commits unreachable from
+        # other refs (excluding this branch itself so its presence doesn't
+        # mask the check).
+        branch = _git_branch(worktree_dir)
+        if branch is None:
+            # Detached HEAD with no upstream — treat conservatively as at-risk.
+            return {"status": "no_upstream", "has_unique_commits": True}
+        # `--exclude` patterns must drop the `refs/heads/` prefix when paired
+        # with `--branches` (likewise for remotes/tags). The exclusion only
+        # applies to the next ref-set option, so we exclude the current branch
+        # under --branches and leave --remotes / --tags fully included.
+        unique = subprocess.run(
+            ["git", "-C", worktree_dir, "rev-list", "--count", "HEAD",
+             "--not", "--exclude=" + branch, "--branches",
+             "--remotes", "--tags"],
+            capture_output=True, text=True,
+        )
+        if unique.returncode != 0:
+            # Defensive: rev-list errors -> treat as at-risk.
+            return {"status": "no_upstream", "has_unique_commits": True}
+        count = int((unique.stdout.strip() or "0"))
+        return {"status": "no_upstream", "has_unique_commits": count > 0}
+
+    # Upstream exists. Count ahead commits.
+    ahead = subprocess.run(
+        ["git", "-C", worktree_dir, "rev-list", "--count", "@{u}..HEAD"],
+        capture_output=True, text=True,
+    )
+    if ahead.returncode != 0:
+        return {"status": "ok"}  # safe default
+    count = int((ahead.stdout.strip() or "0"))
+    if count > 0:
+        return {"status": "ahead", "ahead_count": count}
+    return {"status": "ok"}
+
+
+def _find_pipfile_dirs(worktree_dir):
+    """Yield every directory under `worktree_dir` that contains a `Pipfile`.
+
+    Pure file walk -- no subprocess invocation. Separated so the cleanup
+    logic can be unit-tested independently of pipenv.
+    """
+    for dirpath, _dirnames, filenames in os.walk(worktree_dir):
+        if "Pipfile" in filenames:
+            yield dirpath
+
+
+def _cleanup_worktree(worktree_dir):
+    """R060012. Tear down pipenv envs for every Pipfile under `worktree_dir`.
+
+    Returns True if cleanup ran (pipenv invocations performed for any
+    Pipfiles found), False if `pipenv` is not on PATH and cleanup was
+    skipped. Non-zero exit from `pipenv --rm` is ignored (treated as
+    'no env for this Pipfile').
+    """
+    for pipfile_dir in _find_pipfile_dirs(worktree_dir):
+        try:
+            subprocess.run(
+                ["pipenv", "--rm"],
+                cwd=pipfile_dir,
+                capture_output=True, text=True, check=False,
+            )
+        except FileNotFoundError:
+            return False
+    return True
+
+
+def _git_worktree_remove(git_cwd, worktree_dir):
+    """R060013. `git -C <git_cwd> worktree remove <worktree_dir>` (no --force)."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", git_cwd, "worktree", "remove", worktree_dir],
+            capture_output=True, text=True,
+        )
+    except FileNotFoundError:
+        raise GitError("`git` was not found on PATH.")
+    if result.returncode != 0:
+        raise GitError(result.stderr.strip() or "git worktree remove failed.")
+
+
+def _confirm_safe_removal(worktree_dir, worktree_name):
+    """Run all pre-removal checks. Returns (ok: bool, error_message_or_None).
+
+    Wraps R060008, R060009, R060010 (per R060011 — single entry point for
+    every pre-check and approval prompt). May open synchronous
+    `sublime.ok_cancel_dialog` boxes for the no-upstream and ahead prompts.
+    """
+    # R060008: uncommitted changes are a hard block.
+    err = _check_uncommitted_changes(worktree_dir)
+    if err is not None:
+        return False, err
+
+    upstream = _check_upstream(worktree_dir)
+    if upstream["status"] == "no_upstream" and upstream["has_unique_commits"]:
+        # R060009: branch has no upstream and commits are at risk.
+        if not sublime.ok_cancel_dialog(
+            "Worktree '{}' tracks a branch with no upstream, and it has commits "
+            "not reachable from any other ref. Removing it may lose work. "
+            "Continue?".format(worktree_name),
+            "Remove anyway",
+        ):
+            return False, "Aborted by user (branch has no upstream and unique commits)."
+    elif upstream["status"] == "ahead":
+        # R060010: branch is ahead of its upstream.
+        if not sublime.ok_cancel_dialog(
+            "Worktree '{}' is {} commit(s) ahead of its upstream. Removing it "
+            "may lose work that hasn't been pushed. Continue?".format(
+                worktree_name, upstream["ahead_count"]
+            ),
+            "Remove anyway",
+        ):
+            return False, "Aborted by user (branch is ahead of upstream)."
+
+    return True, None
+
+
+def _do_remove(root, config, entry, worktree_dir, main_dir):
+    """Side-effecting orchestrator for Remove.
+
+    Order matters:
+      1. _cleanup_worktree(worktree_dir)         # R060012 (best effort)
+      2. _git_worktree_remove(main_dir, ...)     # R060013
+      3. os.remove(<project file>)               # R060014
+      4. drop entry from config and _write_json  # R060015
+
+    Returns the boolean from `_cleanup_worktree` so the caller can message
+    whether cleanup actually ran. Raises GitError or OSError on failure.
+    """
+    cleanup_ran = _cleanup_worktree(worktree_dir)
+    _git_worktree_remove(main_dir, worktree_dir)
+
+    project_path = os.path.join(root, SUBLIME_PROJECTS_DIRNAME, entry["project_file"])
+    os.remove(project_path)
+
+    config["worktrees"] = [
+        wt for wt in config["worktrees"] if wt["name"] != entry["name"]
+    ]
+    _write_json(os.path.join(root, CONFIG_FILENAME), config)
+    return cleanup_ran
+
+
 def _identify_current_worktree(folder, root, config):
     """R050005: return the name of the worktree containing `folder`, or None.
 
@@ -856,4 +1032,98 @@ class SubtreeSwitchCommand(sublime_plugin.WindowCommand):
 
 class SubtreeRemoveCommand(sublime_plugin.WindowCommand):
     def run(self):
-        pass
+        # R060001: must have a folder open.
+        folders = self.window.folders()
+        if not folders:
+            sublime.error_message(
+                "Subtree: Remove requires a folder open in the window (R060001)."
+            )
+            return
+
+        # R060002 / R060003: locate root.
+        root = _find_root(folders[0])
+        if root is None:
+            sublime.error_message(
+                "Subtree: No {} found at or above {} (R060003).".format(
+                    CONFIG_FILENAME, folders[0]
+                )
+            )
+            return
+
+        # R060004: read + validate config.
+        try:
+            config = _read_config(root)
+        except (OSError, ValueError) as e:
+            sublime.error_message("Subtree: {} (R060004)".format(e))
+            return
+
+        # R060005: list excludes the main worktree (R010001 forbids removing it).
+        main_name = config["meta_information"]["main_worktree"]
+        candidates = [wt for wt in config["worktrees"] if wt["name"] != main_name]
+        if not candidates:
+            sublime.error_message(
+                "Subtree: No removable worktrees (only the main worktree is managed) (R060005)."
+            )
+            return
+
+        names = [wt["name"] for wt in candidates]
+        self.window.show_quick_panel(
+            names,
+            lambda idx: self._on_picked(root, config, candidates, idx),
+            placeholder="Pick worktree to remove",
+        )
+
+    def _on_picked(self, root, config, candidates, idx):
+        if idx < 0:
+            return  # R060006: user dismissed.
+
+        entry = candidates[idx]
+        worktree_name = entry["name"]
+        worktree_dir = os.path.join(root, WORKTREES_DIRNAME, worktree_name)
+
+        # R060007: reject if user picked their own currently-open worktree.
+        current = _identify_current_worktree(self.window.folders()[0], root, config)
+        if current == worktree_name:
+            sublime.error_message(
+                "Subtree: Cannot remove the currently opened worktree '{}'. "
+                "Switch to another worktree first (R060007).".format(worktree_name)
+            )
+            return
+
+        # R060008 / R060009 / R060010 / R060011: all pre-checks under one roof.
+        ok, reason = _confirm_safe_removal(worktree_dir, worktree_name)
+        if not ok:
+            sublime.error_message("Subtree: {}".format(reason))
+            return
+
+        # Slow work off the UI thread.
+        sublime.set_timeout_async(
+            lambda: self._run_remove(root, config, entry, worktree_dir),
+            0,
+        )
+
+    def _run_remove(self, root, config, entry, worktree_dir):
+        try:
+            main_dir = _find_main_worktree(root, config)
+        except ValueError as e:
+            sublime.error_message("Subtree: {}".format(e))
+            return
+
+        try:
+            cleanup_ran = _do_remove(root, config, entry, worktree_dir, main_dir)
+        except GitError as e:
+            sublime.error_message(
+                "Subtree: git worktree remove failed: {} (R060016)".format(e)
+            )
+            return
+        except OSError as e:
+            sublime.error_message(
+                "Subtree: Remove failed mid-operation: {}.\n\n"
+                "Inspect {} manually (R060016).".format(e, root)
+            )
+            return
+
+        suffix = "" if cleanup_ran else " (pipenv not installed; cleanup skipped)"
+        sublime.status_message(
+            "Subtree: removed worktree '{}'{}".format(entry["name"], suffix)
+        )

@@ -90,4 +90,19 @@ Numbering scheme: `R<section><index>`, where `<section>` is a two-digit section 
 
 ## 6. Remove operation
 
-*To be specified.*
+- **R060001** — `remove` may only run from a Sublime window that has a folder open; it operates on `window.folders()[0]`. It errors if no folder is open.
+- **R060002** — `remove` locates the [root directory](glossary.md#root-directory) by walking upward from the operating folder until it finds a directory containing [`subtree_config.json`](schemas/subtree_config.md) (same algorithm as [R030002](#3-create-operation)).
+- **R060003** — `remove` aborts without modification if no `subtree_config.json` is found.
+- **R060004** — `remove` aborts without modification if `subtree_config.json` cannot be parsed as JSON matching the [Subtree config schema](schemas/subtree_config.md).
+- **R060005** — `remove` presents a quick panel listing every entry in `worktrees[].name` **except** `meta_information.main_worktree` ([R010001](#1-restrictions-and-general-requirements) forbids removing the main worktree). If the resulting list is empty, `remove` aborts with a message.
+- **R060006** — `remove` aborts without modification if the user dismisses the quick panel.
+- **R060007** — `remove` aborts without modification if the picked worktree is the **currently opened worktree** (identified using the same algorithm as [R050005](#5-switch-operation)), and surfaces a message asking the user to switch to another worktree first.
+- **R060008** — Pre-check: `remove` runs `git -C <worktree-dir> status --porcelain`. If the output is non-empty, `remove` aborts and shows the offending lines to the user. (This catches modified tracked files, staged changes, and untracked non-`.gitignore`d files.)
+- **R060009** — Pre-check: if the worktree's current branch has no upstream configured, `remove` computes the count of commits reachable from `HEAD` but not from any other ref under `refs/heads/`, `refs/remotes/`, or `refs/tags/`. If that count is greater than zero, `remove` prompts the user for confirmation; cancellation aborts the operation.
+- **R060010** — Pre-check: if the worktree's current branch has an upstream and is ahead of it by N > 0 commits, `remove` prompts the user for confirmation; cancellation aborts the operation.
+- **R060011** — All pre-checks (R060008 / R060009 / R060010) run before any modification or cleanup. The first to abort or be cancelled stops the operation entirely.
+- **R060012** — Cleanup: `remove` recursively walks the worktree directory; for every directory that contains a `Pipfile`, it runs `pipenv --rm` in that directory. Non-zero exit from `pipenv --rm` is ignored (taken as "no env to remove"). If the `pipenv` executable is not on `PATH`, cleanup is skipped entirely with a status message; the remainder of `remove` proceeds.
+- **R060013** — `remove` invokes `git -C <main-worktree-dir> worktree remove <worktree-dir>` (without `--force`). On failure, `remove` aborts and surfaces git's stderr.
+- **R060014** — `remove` deletes the worktree entry's sublime-project file at `<root>/sublime_projects/<project_file>`.
+- **R060015** — `remove` removes the entry from `worktrees[]` in [`subtree_config.json`](schemas/subtree_config.md) and rewrites the file with the same 4-space indent + trailing newline used elsewhere.
+- **R060016** — Failures during R060013, R060014, or R060015 are reported with a message that includes the root path so the user can inspect the partial state manually. Subtree does not attempt automatic rollback.
