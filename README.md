@@ -2,7 +2,7 @@
 
 A Sublime Text plugin for managing git worktrees and projects.
 
-> Status: early scaffold. `Init` and `Create` are implemented; `Open` and `Remove` are stubs.
+> Status: early scaffold. `Init`, `Create`, and `Open` are implemented; `Remove` is a stub.
 
 ## Documentation
 
@@ -14,7 +14,7 @@ All commands are available from the Command Palette (`Ctrl+Shift+P` / `Cmd+Shift
 
 - **Subtree: Init** — initialize subtree management in the current repository
 - **Subtree: Create** — create a new worktree from a selected existing worktree; prompts for the new branch name and creates the branch if it doesn't exist locally, otherwise checks it out
-- **Subtree: Open** — open an existing worktree
+- **Subtree: Open** — materialize an existing branch as a new worktree; lists local and remote branches that don't already have a worktree, creates a tracking branch when picking a remote (with the remote prefix stripped), and copies a chosen worktree's project file as the template
 - **Subtree: Remove** — remove a worktree
 
 ## Installation

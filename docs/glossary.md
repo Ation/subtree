@@ -24,11 +24,11 @@ Directory Subtree is currently acting on — typically the working directory of 
 
 ### Worktree directory
 
-Filesystem path of a single git worktree, e.g. `worktrees/master`. Its directory name equals the branch name it tracks (see [R010002](requirements.md#1-restrictions-and-general-requirements)).
+Filesystem path of a single git worktree. Its path under `worktrees/` equals the branch name it tracks (see [R010002](requirements.md#1-restrictions-and-general-requirements)), with `/` interpreted as a path separator. Examples: `worktrees/master`, `worktrees/feature/foo`.
 
 ### Branch name
 
-Name of the git branch checked out in a worktree. By [R010002](requirements.md#1-restrictions-and-general-requirements) it equals the worktree directory name.
+Name of the git branch checked out in a worktree. By [R010002](requirements.md#1-restrictions-and-general-requirements) it equals the worktree directory's path under `worktrees/`. `/` is allowed and creates nested directories. The corresponding sublime-project filename substitutes `/` with `__` (see [R010003](requirements.md#1-restrictions-and-general-requirements)).
 
 ### Current project
 
@@ -40,7 +40,12 @@ Worktree that owns the `.git` directory and tracks the repository's main (master
 
 ### Source worktree
 
-Existing worktree selected as the base when running [`create`](requirements.md#3-create-operation). Its branch is the start point for the new worktree's branch — or, if a branch with the entered name already exists locally, that branch is checked out into the new worktree instead. Its sublime-project file is the template for the new one. Recorded in [`subtree_config.json`](schemas/subtree_config.md) as `worktrees[].created_from` of the new entry.
+Existing worktree selected by the user as the base for a new worktree, or as the project-file template for one.
+
+- In [`create`](requirements.md#3-create-operation) the same source worktree is both the base for the git operation (its branch is the start point for the new branch, or its existing branch is checked out) and the template for the project file.
+- In [`open`](requirements.md#4-open-operation) the picked branch supplies the git base; a separate source worktree, picked from a second quick panel, supplies only the project-file template.
+
+In both cases, the chosen source worktree's name is recorded in [`subtree_config.json`](schemas/subtree_config.md) as `worktrees[].created_from` of the new entry.
 
 ### Subtree config file
 

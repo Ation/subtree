@@ -59,9 +59,6 @@ class TestValidateBranchName(unittest.TestCase):
     def test_rejects_empty(self):
         self.assertIsNotNone(subtree._validate_branch_name(""))
 
-    def test_rejects_forward_slash(self):
-        self.assertIsNotNone(subtree._validate_branch_name("feature/foo"))
-
     def test_rejects_backslash(self):
         self.assertIsNotNone(subtree._validate_branch_name("feature\\foo"))
 

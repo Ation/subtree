@@ -49,4 +49,4 @@ Name of the [source worktree](../glossary.md#source-worktree) (the entry in `wor
 
 ### `worktrees[].project_file` *(string)*
 
-Basename of the matching sublime-project file under `sublime_projects/`. By convention this is `<repository_name>_<name>.sublime-project`.
+Basename of the matching sublime-project file under `sublime_projects/`. Computed per [R010003](../requirements.md#1-restrictions-and-general-requirements): `<repository_name>_<name>.sublime-project`, with every `/` in `<name>` replaced by `__`.

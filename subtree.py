@@ -81,7 +81,7 @@ def _do_init(target, repo_name, branch):
             os.path.join(main_worktree_dir, entry),
         )
 
-    project_filename = "{}_{}.sublime-project".format(repo_name, branch)
+    project_filename = _branch_to_project_filename(repo_name, branch)  # R010003
     config = {
         "meta_information": {
             "repository_name": repo_name,
@@ -105,15 +105,28 @@ def _do_init(target, repo_name, branch):
 def _validate_branch_name(name):
     """Return an error message if `name` is invalid (R030010), else None.
 
-    Uses the same charset rule as `_validate_repo_name` because the branch
-    name is reused unchanged as both a worktree directory name (per R010002)
-    and as a filename component of the sublime-project file.
+    The branch name is the worktree's path under `worktrees/` (R010002) and,
+    with `/` substituted by `__`, the project-file filename component (R010003).
+    Allow `/`, reject `\\` and control chars, and reject pathological segments.
     """
     if not name:
         return "Branch name must not be empty."
-    if _INVALID_REPO_NAME_RE.search(name):
-        return "Branch name must not contain '/', '\\', or control characters."
+    if "\\" in name:
+        return "Branch name must not contain '\\'."
+    for ch in name:
+        if ord(ch) < 0x20:
+            return "Branch name must not contain control characters."
+    for seg in name.split("/"):
+        if seg == "":
+            return "Branch name must not contain empty path segments (no leading, trailing, or doubled '/')."
+        if seg in (".", ".."):
+            return "Branch name must not contain '.' or '..' path segments."
     return None
+
+
+def _branch_to_project_filename(repo_name, branch):
+    """R010003: '<repo>_<branch>.sublime-project' with '/' in branch -> '__'."""
+    return "{}_{}.sublime-project".format(repo_name, branch.replace("/", "__"))
 
 
 def _find_root(start_dir):
@@ -272,6 +285,12 @@ def _do_create(source_dir, source_name, source_template,
     Raises GitError on git failure (no Subtree files written), OSError on a
     later write failure (worktree dir already exists on disk).
     """
+    # R010002: branches with '/' produce nested paths under worktrees/. Ensure
+    # the parent directory exists before invoking git (git already does this,
+    # but be defensive against undocumented behaviour).
+    parent = os.path.dirname(new_worktree_dir)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
     _git_worktree_add(source_dir, new_worktree_dir, branch, base_branch)
 
     new_project = _rewrite_template(source_template, new_worktree_dir)
@@ -283,6 +302,83 @@ def _do_create(source_dir, source_name, source_template,
         "project_file": project_filename,
     })
     _write_json(os.path.join(root, CONFIG_FILENAME), config)
+
+
+def _find_main_worktree(root, config):
+    """Return absolute path of the main worktree's directory, or raise ValueError."""
+    main_name = config["meta_information"]["main_worktree"]
+    main_dir = os.path.join(root, WORKTREES_DIRNAME, main_name)
+    if not os.path.isdir(main_dir):
+        raise ValueError("Main worktree directory missing: {}".format(main_dir))
+    return main_dir
+
+
+def _list_openable_branches(git_cwd):
+    """R040005 / R040006: enumerate branch candidates via `git for-each-ref`.
+
+    Returns a list of dicts:
+        {"display": str, "local_name": str, "remote": str or None, "ref": str}
+
+    `ref` is what to pass to `git worktree add`:
+        - local:  ref == local_name (used without -b)
+        - remote: ref == "<remote>/<local_name>" (used with -b <local_name>)
+
+    Symref entries (e.g. `refs/remotes/origin/HEAD`) are skipped.
+    Raises GitError if git is missing or fails.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "-C", git_cwd, "for-each-ref",
+             "--format=%(refname)%09%(refname:short)%09%(symref)",
+             "refs/heads/", "refs/remotes/"],
+            capture_output=True, text=True,
+        )
+    except FileNotFoundError:
+        raise GitError("`git` was not found on PATH.")
+    if result.returncode != 0:
+        raise GitError("git for-each-ref failed: " + (result.stderr.strip() or "unknown error"))
+
+    candidates = []
+    for line in result.stdout.splitlines():
+        if not line:
+            continue
+        parts = line.split("\t")
+        if len(parts) < 3:
+            continue
+        refname, shortname, symref = parts[0], parts[1], parts[2]
+        if symref:
+            continue  # R040005: skip HEAD pointers and other symrefs.
+        if refname.startswith("refs/heads/"):
+            candidates.append({
+                "display": shortname,
+                "local_name": shortname,
+                "remote": None,
+                "ref": shortname,
+            })
+        elif refname.startswith("refs/remotes/"):
+            # R040006: split on first '/'.
+            if "/" not in shortname:
+                continue
+            remote, local_name = shortname.split("/", 1)
+            candidates.append({
+                "display": "{}  ({})".format(local_name, remote),
+                "local_name": local_name,
+                "remote": remote,
+                "ref": shortname,
+            })
+    return candidates
+
+
+def _filter_openable(candidates, existing_worktree_names, local_branch_names):
+    """R040007: drop candidates already managed and remote duplicates of locals."""
+    result = []
+    for c in candidates:
+        if c["local_name"] in existing_worktree_names:
+            continue
+        if c["remote"] is not None and c["local_name"] in local_branch_names:
+            continue
+        result.append(c)
+    return result
 
 
 def _open_project_and_close(window, project_path, op_label):
@@ -392,6 +488,7 @@ class SubtreeCreateCommand(sublime_plugin.WindowCommand):
         self.window.show_quick_panel(
             names,
             lambda idx: self._on_source_picked(root, config, idx),
+            placeholder="Pick source worktree (its branch is the start point and its project file is the template)",
         )
 
     def _on_source_picked(self, root, config, idx):
@@ -451,7 +548,7 @@ class SubtreeCreateCommand(sublime_plugin.WindowCommand):
 
         repo_name = config["meta_information"]["repository_name"]
         new_worktree_dir = os.path.join(root, WORKTREES_DIRNAME, branch)
-        project_filename = "{}_{}.sublime-project".format(repo_name, branch)
+        project_filename = _branch_to_project_filename(repo_name, branch)  # R010003
         new_project_path = os.path.join(root, SUBLIME_PROJECTS_DIRNAME, project_filename)
 
         # R030012 / R030013: filesystem collisions.
@@ -511,7 +608,159 @@ class SubtreeCreateCommand(sublime_plugin.WindowCommand):
 
 class SubtreeOpenCommand(sublime_plugin.WindowCommand):
     def run(self):
-        pass
+        # R040001: must have a folder open.
+        folders = self.window.folders()
+        if not folders:
+            sublime.error_message(
+                "Subtree: Open requires a folder open in the window (R040001)."
+            )
+            return
+
+        # R040002 / R040003: locate root.
+        root = _find_root(folders[0])
+        if root is None:
+            sublime.error_message(
+                "Subtree: No {} found at or above {} (R040003).".format(
+                    CONFIG_FILENAME, folders[0]
+                )
+            )
+            return
+
+        # R040004: read + validate config.
+        try:
+            config = _read_config(root)
+        except (OSError, ValueError) as e:
+            sublime.error_message("Subtree: {} (R040004)".format(e))
+            return
+
+        try:
+            main_dir = _find_main_worktree(root, config)
+        except ValueError as e:
+            sublime.error_message("Subtree: {}".format(e))
+            return
+
+        # R040005 / R040006: enumerate candidates.
+        try:
+            candidates = _list_openable_branches(main_dir)
+        except GitError as e:
+            sublime.error_message("Subtree: {}".format(e))
+            return
+
+        # R040007: filter already-managed and remote-shadowing-local.
+        existing_names = {wt["name"] for wt in config["worktrees"]}
+        local_names = {c["local_name"] for c in candidates if c["remote"] is None}
+        candidates = _filter_openable(candidates, existing_names, local_names)
+
+        if not candidates:
+            sublime.error_message(
+                "Subtree: No openable branches found (every branch either already "
+                "has a worktree or its local form is already listed)."
+            )
+            return
+
+        # R040008: branch quick panel.
+        displays = [c["display"] for c in candidates]
+        self.window.show_quick_panel(
+            displays,
+            lambda idx: self._on_branch_picked(root, config, main_dir, candidates, idx),
+            placeholder="Pick a branch to open as a worktree",
+        )
+
+    def _on_branch_picked(self, root, config, main_dir, candidates, idx):
+        if idx < 0:
+            return  # R040009: user dismissed.
+
+        candidate = candidates[idx]
+        branch = candidate["local_name"]
+
+        # R040010: defensive branch-name validation.
+        err = _validate_branch_name(branch)
+        if err is not None:
+            sublime.error_message("Subtree: {} (R040010)".format(err))
+            return
+
+        repo_name = config["meta_information"]["repository_name"]
+        new_worktree_dir = os.path.join(root, WORKTREES_DIRNAME, branch)
+        project_filename = _branch_to_project_filename(repo_name, branch)  # R010003
+        new_project_path = os.path.join(root, SUBLIME_PROJECTS_DIRNAME, project_filename)
+
+        # R040011 / R040012: filesystem collisions.
+        if os.path.exists(new_worktree_dir):
+            sublime.error_message(
+                "Subtree: Worktree directory already exists: {} (R040011).".format(new_worktree_dir)
+            )
+            return
+        if os.path.exists(new_project_path):
+            sublime.error_message(
+                "Subtree: Sublime-project file already exists: {} (R040012).".format(new_project_path)
+            )
+            return
+
+        # R040013: template-source quick panel.
+        names = [wt["name"] for wt in config["worktrees"]]
+        self.window.show_quick_panel(
+            names,
+            lambda tpl_idx: self._on_template_picked(
+                root, config, main_dir, candidate,
+                branch, new_worktree_dir, new_project_path, project_filename,
+                tpl_idx,
+            ),
+            placeholder="Pick worktree whose project file will be used as the template",
+        )
+
+    def _on_template_picked(self, root, config, main_dir, candidate,
+                            branch, new_worktree_dir, new_project_path, project_filename,
+                            idx):
+        if idx < 0:
+            return  # R040013: user dismissed template panel.
+
+        template_entry = config["worktrees"][idx]
+        template_name = template_entry["name"]
+        template_project_path = os.path.join(
+            root, SUBLIME_PROJECTS_DIRNAME, template_entry["project_file"]
+        )
+
+        # R040014: validate template before doing any git work.
+        try:
+            source_template = _load_source_template(template_project_path)
+        except ValueError as e:
+            sublime.error_message("Subtree: {} (R040014)".format(e))
+            return
+
+        sublime.set_timeout_async(
+            lambda: self._run_open(
+                root, config, main_dir, candidate, template_name, source_template,
+                branch, new_worktree_dir, new_project_path, project_filename,
+            ),
+            0,
+        )
+
+    def _run_open(self, root, config, main_dir, candidate, template_name, source_template,
+                  branch, new_worktree_dir, new_project_path, project_filename):
+        # R040015 / R040016: base ref is None for local, the remote ref for remote-only.
+        base_branch = None if candidate["remote"] is None else candidate["ref"]
+
+        try:
+            _do_create(
+                main_dir, template_name, source_template,
+                new_worktree_dir, new_project_path,
+                branch, base_branch, project_filename, root, config,
+            )
+        except GitError as e:
+            sublime.error_message(
+                "Subtree: git worktree add failed: {} (R040020)".format(e)
+            )
+            return
+        except OSError as e:
+            sublime.error_message(
+                "Subtree: Open succeeded in git but failed writing Subtree files: {}.\n\n"
+                "Inspect {} manually.".format(e, root)
+            )
+            return
+
+        sublime.set_timeout(
+            lambda: _open_project_and_close(self.window, new_project_path, "Open"), 0
+        )
 
 
 class SubtreeRemoveCommand(sublime_plugin.WindowCommand):
