@@ -45,7 +45,7 @@ Branch name tracked by the worktree. Equals the worktree directory name on disk 
 
 ### `worktrees[].created_from` *(string or null)*
 
-Name of the parent worktree's branch (the branch this worktree was branched from). `null` for the main worktree.
+Name of the [source worktree](../glossary.md#source-worktree) (the entry in `worktrees[].name` selected as the base during [`create`](../requirements.md#3-create-operation)). `null` for the [main worktree](../glossary.md#main-worktree).
 
 ### `worktrees[].project_file` *(string)*
 

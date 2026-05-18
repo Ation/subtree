@@ -38,6 +38,10 @@ The `.sublime-project` file corresponding to the worktree that contains the curr
 
 Worktree that owns the `.git` directory and tracks the repository's main (master) branch. Cannot be removed by Subtree ([R010001](requirements.md#1-restrictions-and-general-requirements)).
 
+### Source worktree
+
+Existing worktree selected as the base when running [`create`](requirements.md#3-create-operation). Its branch is the start point for the new worktree's branch — or, if a branch with the entered name already exists locally, that branch is checked out into the new worktree instead. Its sublime-project file is the template for the new one. Recorded in [`subtree_config.json`](schemas/subtree_config.md) as `worktrees[].created_from` of the new entry.
+
 ### Subtree config file
 
 [`subtree_config.json`](schemas/subtree_config.md) at the root directory; the source of truth for Subtree's view of the repository.

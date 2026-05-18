@@ -13,6 +13,6 @@ After [`init`](requirements.md#2-init-operation), a Subtree-managed [target repo
 
 ## Notes
 
-- The [main worktree](glossary.md#main-worktree) directory (`worktrees/<main-branch>/`) holds the real `.git` directory. Additional worktrees use linked `.git` files, as created by `git worktree add`.
+- The [main worktree](glossary.md#main-worktree) directory (`worktrees/<main-branch>/`) holds the real `.git` directory. Additional worktrees, added by [`create`](requirements.md#3-create-operation), appear as siblings under `worktrees/` and use linked `.git` files (as created by `git worktree add`); each one has a matching sublime-project file under `sublime_projects/`.
 - [Sublime project files](schemas/sublime_project.md) live in `sublime_projects/` and are named `<repository_name>_<branch>.sublime-project`, where `<repository_name>` is the value set during `init` and `<branch>` is the branch tracked by the worktree.
 - Mapping from a worktree to its sublime-project file is recorded in [`subtree_config.json`](schemas/subtree_config.md) under `worktrees[].project_file`.
