@@ -89,6 +89,9 @@ def _do_init(target, repo_name, branch):
             "repository_name": repo_name,
             "main_worktree": branch,
         },
+        "settings": {
+          "copy_directories": []
+        },
         "worktrees": [
             {
                 "name": branch,
