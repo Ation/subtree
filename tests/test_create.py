@@ -218,11 +218,11 @@ class TestLoadSourceTemplate(unittest.TestCase):
 
 
 class TestRewriteTemplate(unittest.TestCase):
-    """R030017 — rewrite folders[0].path, preserve everything else."""
+    """R030017 — recursive find/replace of the source worktree path."""
 
     def test_rewrites_folder_path(self):
         source = {"folders": [{"path": "/old"}]}
-        new = subtree._rewrite_template(source, "/new")
+        new = subtree._rewrite_template(source, "/old", "/new")
         self.assertEqual(new["folders"][0]["path"], "/new")
 
     def test_preserves_other_top_level_keys(self):
@@ -231,7 +231,7 @@ class TestRewriteTemplate(unittest.TestCase):
             "settings": {"tab_size": 2},
             "build_systems": [{"name": "x"}],
         }
-        new = subtree._rewrite_template(source, "/new")
+        new = subtree._rewrite_template(source, "/old", "/new")
         self.assertEqual(new["settings"], {"tab_size": 2})
         self.assertEqual(new["build_systems"], [{"name": "x"}])
 
@@ -241,14 +241,137 @@ class TestRewriteTemplate(unittest.TestCase):
             "folder_exclude_patterns": [".venv"],
             "name": "main",
         }]}
-        new = subtree._rewrite_template(source, "/new")
+        new = subtree._rewrite_template(source, "/old", "/new")
         self.assertEqual(new["folders"][0]["folder_exclude_patterns"], [".venv"])
         self.assertEqual(new["folders"][0]["name"], "main")
 
     def test_does_not_mutate_source(self):
         source = {"folders": [{"path": "/old"}]}
-        subtree._rewrite_template(source, "/new")
+        subtree._rewrite_template(source, "/old", "/new")
         self.assertEqual(source["folders"][0]["path"], "/old")
+
+    def test_rewrites_path_in_build_systems_working_dir(self):
+        source = {
+            "folders": [{"path": "/repo/worktrees/master"}],
+            "build_systems": [{"working_dir": "/repo/worktrees/master/src"}],
+        }
+        new = subtree._rewrite_template(
+            source, "/repo/worktrees/master", "/repo/worktrees/feature/foo"
+        )
+        self.assertEqual(
+            new["build_systems"][0]["working_dir"],
+            "/repo/worktrees/feature/foo/src",
+        )
+
+    def test_rewrites_path_in_cmd_list_elements(self):
+        source = {
+            "folders": [{"path": "/repo/worktrees/master"}],
+            "build_systems": [{"cmd": [
+                "python",
+                "/repo/worktrees/master/scripts/run.py",
+                "--config",
+                "/etc/app/config.yaml",
+            ]}],
+        }
+        new = subtree._rewrite_template(
+            source, "/repo/worktrees/master", "/repo/worktrees/feature/foo"
+        )
+        self.assertEqual(new["build_systems"][0]["cmd"], [
+            "python",
+            "/repo/worktrees/feature/foo/scripts/run.py",
+            "--config",
+            "/etc/app/config.yaml",
+        ])
+
+    def test_rewrites_deep_file_path_under_source(self):
+        source = {
+            "folders": [{"path": "/repo/worktrees/master"}],
+            "settings": {"log_file": "/repo/worktrees/master/logs/sub/app.log"},
+        }
+        new = subtree._rewrite_template(
+            source, "/repo/worktrees/master", "/repo/worktrees/feature/foo"
+        )
+        self.assertEqual(
+            new["settings"]["log_file"],
+            "/repo/worktrees/feature/foo/logs/sub/app.log",
+        )
+
+    def test_rewrites_path_inside_nested_settings_dict(self):
+        source = {
+            "folders": [{"path": "/old"}],
+            "settings": {
+                "nested": {
+                    "deeper": {"path": "/old/a/b/c"},
+                    "list": ["/old/x", "irrelevant"],
+                }
+            },
+        }
+        new = subtree._rewrite_template(source, "/old", "/new")
+        self.assertEqual(new["settings"]["nested"]["deeper"]["path"], "/new/a/b/c")
+        self.assertEqual(new["settings"]["nested"]["list"], ["/new/x", "irrelevant"])
+
+    def test_ignores_relative_paths(self):
+        source = {
+            "folders": [{
+                "path": "/repo/worktrees/master",
+                "folder_exclude_patterns": [".venv", "build"],
+            }],
+            "settings": {"lint_dirs": ["src", "./scripts", "../sibling"]},
+        }
+        new = subtree._rewrite_template(
+            source, "/repo/worktrees/master", "/repo/worktrees/feature/foo"
+        )
+        self.assertEqual(
+            new["folders"][0]["folder_exclude_patterns"], [".venv", "build"]
+        )
+        self.assertEqual(
+            new["settings"]["lint_dirs"], ["src", "./scripts", "../sibling"]
+        )
+
+    def test_ignores_absolute_paths_outside_source(self):
+        source = {
+            "folders": [{"path": "/repo/worktrees/master"}],
+            "settings": {"external_tool": "/usr/local/bin/tool"},
+        }
+        new = subtree._rewrite_template(
+            source, "/repo/worktrees/master", "/repo/worktrees/feature/foo"
+        )
+        self.assertEqual(
+            new["settings"]["external_tool"], "/usr/local/bin/tool"
+        )
+
+    def test_does_not_rewrite_json_keys(self):
+        source = {
+            "folders": [{"path": "/old"}],
+            "settings": {"/old": "value-stays"},
+        }
+        new = subtree._rewrite_template(source, "/old", "/new")
+        self.assertIn("/old", new["settings"])
+        self.assertNotIn("/new", new["settings"])
+        self.assertEqual(new["settings"]["/old"], "value-stays")
+
+    def test_naive_substring_swap_affects_sibling_paths(self):
+        """Documented trade-off: literal str.replace rewrites sibling prefixes too."""
+        source = {
+            "folders": [{"path": "/repo/worktrees/master"}],
+            "settings": {"sibling": "/repo/worktrees/master_old/x"},
+        }
+        new = subtree._rewrite_template(
+            source, "/repo/worktrees/master", "/repo/worktrees/feature/foo"
+        )
+        self.assertEqual(
+            new["settings"]["sibling"], "/repo/worktrees/feature/foo_old/x"
+        )
+
+    def test_passes_through_non_string_scalars(self):
+        source = {
+            "folders": [{"path": "/old"}],
+            "settings": {"tab_size": 2, "translate_tabs_to_spaces": True, "ruler": None},
+        }
+        new = subtree._rewrite_template(source, "/old", "/new")
+        self.assertEqual(new["settings"]["tab_size"], 2)
+        self.assertEqual(new["settings"]["translate_tabs_to_spaces"], True)
+        self.assertIsNone(new["settings"]["ruler"])
 
 
 class TestResolveBaseBranch(unittest.TestCase):
@@ -429,6 +552,59 @@ class TestDoCreate(unittest.TestCase):
                 new_data = json.load(f)
             self.assertEqual(new_data["settings"], {"tab_size": 2})
             self.assertEqual(new_data["folders"][0]["folder_exclude_patterns"], [".venv"])
+
+    def test_create_rewrites_absolute_paths_in_settings_and_build_systems(self):
+        """R030017 — every string value containing the source worktree path is rewritten."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root, config = _make_subtree_repo(tmp, repo_name="my_app", branch="master")
+            source_wt = os.path.join(root, "worktrees", "master")
+            source_project = os.path.join(
+                root, "sublime_projects", "my_app_master.sublime-project"
+            )
+            with open(source_project) as f:
+                source_data = json.load(f)
+            source_data["folders"][0]["folder_exclude_patterns"] = [".venv", "build"]
+            source_data["build_systems"] = [{
+                "name": "Run script",
+                "working_dir": source_wt + "/src",
+                "cmd": [
+                    "python",
+                    source_wt + "/scripts/run.py",
+                    "--config",
+                    "/etc/app/config.yaml",
+                ],
+            }]
+            source_data["settings"] = {
+                "log_file": source_wt + "/logs/app.log",
+                "external_tool": "/usr/local/bin/tool",
+                "lint_dirs": ["src", source_wt + "/tests/unit"],
+            }
+            with open(source_project, "w") as f:
+                json.dump(source_data, f)
+
+            wt, proj = self._call_create(root, config, "master", "feature_1")
+            with open(proj) as f:
+                new_data = json.load(f)
+
+            self.assertEqual(new_data["folders"][0]["path"], wt)
+            self.assertEqual(
+                new_data["folders"][0]["folder_exclude_patterns"], [".venv", "build"]
+            )
+            bs = new_data["build_systems"][0]
+            self.assertEqual(bs["working_dir"], wt + "/src")
+            self.assertEqual(bs["cmd"], [
+                "python",
+                wt + "/scripts/run.py",
+                "--config",
+                "/etc/app/config.yaml",
+            ])
+            self.assertEqual(new_data["settings"]["log_file"], wt + "/logs/app.log")
+            self.assertEqual(
+                new_data["settings"]["external_tool"], "/usr/local/bin/tool"
+            )
+            self.assertEqual(
+                new_data["settings"]["lint_dirs"], ["src", wt + "/tests/unit"]
+            )
 
     def test_aborts_on_multi_folder_source(self):
         """R030008 — source with len(folders) != 1 fails template load."""

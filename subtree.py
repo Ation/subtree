@@ -247,11 +247,24 @@ def _load_source_template(project_path):
     return data
 
 
-def _rewrite_template(source_data, new_worktree_path):
-    """Return a deep copy of `source_data` with folders[0].path replaced (R030017)."""
-    new_data = copy.deepcopy(source_data)
-    new_data["folders"][0]["path"] = new_worktree_path
-    return new_data
+def _rewrite_template(source_data, source_worktree_path, new_worktree_path):
+    """Return a deep copy of `source_data` with every string value's occurrences
+    of `source_worktree_path` replaced by `new_worktree_path` (R030017).
+
+    Find/replace is a naive substring swap applied recursively to every string
+    value (not key) in the JSON. Strings that don't contain the source path
+    are left untouched; relative paths are ignored as a consequence (they
+    cannot contain an absolute path as a substring).
+    """
+    def _rewrite(value):
+        if isinstance(value, str):
+            return value.replace(source_worktree_path, new_worktree_path)
+        if isinstance(value, list):
+            return [_rewrite(v) for v in value]
+        if isinstance(value, dict):
+            return {k: _rewrite(v) for k, v in value.items()}
+        return value
+    return _rewrite(copy.deepcopy(source_data))
 
 
 def _resolve_base_branch(source_dir, branch):
@@ -293,7 +306,11 @@ def _do_create(source_dir, source_name, source_template,
         os.makedirs(parent, exist_ok=True)
     _git_worktree_add(source_dir, new_worktree_dir, branch, base_branch)
 
-    new_project = _rewrite_template(source_template, new_worktree_dir)
+    new_project = _rewrite_template(
+        source_template,
+        os.path.join(root, WORKTREES_DIRNAME, source_name),
+        new_worktree_dir,
+    )
     _write_json(new_project_path, new_project)
 
     config["worktrees"].append({
