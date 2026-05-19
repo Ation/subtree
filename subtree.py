@@ -1261,6 +1261,30 @@ class SubtreeSwitchCommand(sublime_plugin.WindowCommand):
         _open_project_and_close(self.window, project_path, "Switch")
 
 
+class SubtreeEditConfigCommand(sublime_plugin.WindowCommand):
+    def run(self):
+        # R070001: must have a folder open.
+        folders = self.window.folders()
+        if not folders:
+            sublime.error_message(
+                "Subtree: Edit Config requires a folder open in the window (R070001)."
+            )
+            return
+
+        # R070002 / R070003: locate root.
+        root = _find_root(folders[0])
+        if root is None:
+            sublime.error_message(
+                "Subtree: No {} found at or above {} (R070003).".format(
+                    CONFIG_FILENAME, folders[0]
+                )
+            )
+            return
+
+        # R070004: open the config file for editing in this window.
+        self.window.open_file(os.path.join(root, CONFIG_FILENAME))
+
+
 class SubtreeRemoveCommand(sublime_plugin.WindowCommand):
     def run(self):
         # R060001: must have a folder open.

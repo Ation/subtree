@@ -3,5 +3,6 @@
     { "caption": "Subtree: Create", "command": "subtree_create" },
     { "caption": "Subtree: Open", "command": "subtree_open" },
     { "caption": "Subtree: Switch", "command": "subtree_switch" },
-    { "caption": "Subtree: Remove", "command": "subtree_remove" }
+    { "caption": "Subtree: Remove", "command": "subtree_remove" },
+    { "caption": "Subtree: Edit Config", "command": "subtree_edit_config" }
 ]

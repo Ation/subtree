@@ -114,3 +114,10 @@ Numbering scheme: `R<section><index>`, where `<section>` is a two-digit section 
 - **R060014** — `remove` deletes the worktree entry's sublime-project file at `<root>/sublime_projects/<project_file>`.
 - **R060015** — `remove` removes the entry from `worktrees[]` in [`subtree_config.json`](schemas/subtree_config.md) and rewrites the file with the same 4-space indent + trailing newline used elsewhere.
 - **R060016** — Failures during R060013, R060014, or R060015 are reported with a message that includes the root path so the user can inspect the partial state manually. Subtree does not attempt automatic rollback.
+
+## 7. Edit config operation
+
+- **R070001** — `edit-config` may only run from a Sublime window that has a folder open; it operates on `window.folders()[0]`. It errors if no folder is open.
+- **R070002** — `edit-config` locates the [root directory](glossary.md#root-directory) by walking upward from the operating folder until it finds a directory containing [`subtree_config.json`](schemas/subtree_config.md) (same algorithm as [R030002](#3-create-operation)).
+- **R070003** — `edit-config` aborts without modification if no `subtree_config.json` is found.
+- **R070004** — `edit-config` opens `<root>/subtree_config.json` in the current Sublime window for editing. The file is not parsed or validated — opening a malformed config is intentional so the user can fix it in place. The originating window is not closed.
