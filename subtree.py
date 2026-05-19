@@ -2,7 +2,9 @@ import copy
 import json
 import os
 import re
+import shutil
 import subprocess
+import time
 
 import sublime
 import sublime_plugin
@@ -129,6 +131,26 @@ def _branch_to_project_filename(repo_name, branch):
     return "{}_{}.sublime-project".format(repo_name, branch.replace("/", "__"))
 
 
+def _is_valid_relative_subpath(path):
+    """True iff `path` is a relative POSIX-style subpath usable inside a worktree.
+
+    Used to validate `settings.copy_directories` entries. Rejects empty strings,
+    leading '/', backslashes, control characters, and empty / '.' / '..' segments.
+    Forward slashes are the only segment separator (per the schema).
+    """
+    if not isinstance(path, str) or not path:
+        return False
+    if path.startswith("/") or "\\" in path:
+        return False
+    for ch in path:
+        if ord(ch) < 0x20:
+            return False
+    for seg in path.split("/"):
+        if seg == "" or seg in (".", ".."):
+            return False
+    return True
+
+
 def _find_root(start_dir):
     """Walk upward from `start_dir` until a directory containing CONFIG_FILENAME
     is found (R030002). Return its absolute path, or None if none is found
@@ -183,7 +205,146 @@ def _read_config(root):
             raise ValueError(
                 "subtree_config.json: worktrees[{}].created_from must be string or null.".format(i)
             )
+    settings = data.get("settings")
+    if settings is not None:
+        if not isinstance(settings, dict):
+            raise ValueError("subtree_config.json: 'settings' must be an object.")
+        cd = settings.get("copy_directories")
+        if cd is not None:
+            if not isinstance(cd, list):
+                raise ValueError(
+                    "subtree_config.json: settings.copy_directories must be an array."
+                )
+            for i, entry in enumerate(cd):
+                if not isinstance(entry, str):
+                    raise ValueError(
+                        "subtree_config.json: settings.copy_directories[{}] must be a string.".format(i)
+                    )
+                if not _is_valid_relative_subpath(entry):
+                    raise ValueError(
+                        "subtree_config.json: settings.copy_directories[{}] is not a valid relative path: {!r}".format(i, entry)
+                    )
     return data
+
+
+def _get_copy_directories(config):
+    """Return `settings.copy_directories` from the parsed config, or [] if absent."""
+    settings = config.get("settings") or {}
+    return settings.get("copy_directories") or []
+
+
+def _is_gitignored(worktree_dir, relpath):
+    """R030021: return True iff `relpath` is ignored by git in `worktree_dir`.
+
+    Wraps `git -C <worktree_dir> check-ignore -q -- <relpath>`. Exit 0 means
+    ignored, 1 means not ignored, any other exit code is treated as a git
+    error and raised as GitError.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "-C", worktree_dir, "check-ignore", "-q", "--", relpath],
+            capture_output=True,
+        )
+    except FileNotFoundError:
+        raise GitError("`git` was not found on PATH.")
+    if result.returncode == 0:
+        return True
+    if result.returncode == 1:
+        return False
+    stderr = result.stderr.decode("utf-8", "replace").strip() if result.stderr else ""
+    raise GitError(
+        "git check-ignore failed: " + (stderr or "exit {}".format(result.returncode))
+    )
+
+
+def _count_copyable_files(path):
+    """Count non-symlink regular files under `path`.
+
+    Matches the set of files `shutil.copytree(symlinks=True)` invokes its
+    `copy_function` on (symlinked files and dirs are handled separately by
+    `os.symlink`, so they're excluded here to keep `done/total` honest).
+    """
+    n = 0
+    for dirpath, _dirnames, filenames in os.walk(path, followlinks=False):
+        for f in filenames:
+            if not os.path.islink(os.path.join(dirpath, f)):
+                n += 1
+    return n
+
+
+def _copy_listed_directories(source_dir, new_dir, entries, progress=None):
+    """R030021 / R040021: copy each gitignored entry from `source_dir` to `new_dir`.
+
+    Returns a list of human-readable warning strings (empty if every entry was
+    either copied or silently skipped). Never raises; collection-of-warnings
+    is the only failure channel so the caller can continue past R030019 /
+    R040019 (R030022 / R040022).
+
+    If `progress` is a callable, it is invoked as `progress(entry, done, total)`
+    before each entry starts (`done=0`), periodically while files are copied
+    (at most ~10 Hz), and once at completion (`done==total`). Symlink files
+    are not counted in `total` (see `_count_copyable_files`).
+    """
+    warnings = []
+    for rel in entries:
+        parts = rel.split("/")
+        src = os.path.join(source_dir, *parts)
+        if not os.path.isdir(src):
+            continue  # silent skip per R030021.1
+        try:
+            ignored = _is_gitignored(source_dir, rel)
+        except GitError as e:
+            warnings.append(
+                "copy_directories: could not check gitignore for {!r}: {}".format(rel, e)
+            )
+            continue
+        if not ignored:
+            warnings.append(
+                "copy_directories: skipped {!r} (not gitignored in source worktree).".format(rel)
+            )
+            continue
+        dst = os.path.join(new_dir, *parts)
+        if os.path.exists(dst):
+            warnings.append(
+                "copy_directories: skipped {!r} (already exists in new worktree).".format(rel)
+            )
+            continue
+        parent = os.path.dirname(dst)
+        if parent:
+            try:
+                os.makedirs(parent, exist_ok=True)
+            except OSError as e:
+                warnings.append(
+                    "copy_directories: failed to create parent for {!r}: {}".format(rel, e)
+                )
+                continue
+        try:
+            if progress is None:
+                shutil.copytree(src, dst, symlinks=True)
+            else:
+                total = _count_copyable_files(src)
+                done = [0]
+                last = [0.0]
+                progress(rel, 0, total)
+
+                def _copy(s, d, **kw):
+                    shutil.copy2(s, d, **kw)
+                    done[0] += 1
+                    now = time.monotonic()
+                    # Throttle to ~10 Hz; always emit the final tick.
+                    if now - last[0] > 0.1 or done[0] == total:
+                        last[0] = now
+                        progress(rel, done[0], total)
+
+                shutil.copytree(src, dst, symlinks=True, copy_function=_copy)
+                # Ensure callers see done==total even when the throttle suppressed
+                # the last in-loop tick (e.g. zero-file or symlink-only trees).
+                progress(rel, total, total)
+        except OSError as e:
+            warnings.append(
+                "copy_directories: failed to copy {!r}: {}".format(rel, e)
+            )
+    return warnings
 
 
 def _local_branch_exists(repo_cwd, branch):
@@ -288,15 +449,19 @@ def _resolve_base_branch(source_dir, branch):
 
 def _do_create(source_dir, source_name, source_template,
                new_worktree_dir, new_project_path,
-               branch, base_branch, project_filename, root, config):
+               branch, base_branch, project_filename, root, config,
+               copy_directories=(), copy_progress=None):
     """Side-effecting orchestration. Order matters:
 
     1. `git worktree add` (R030014 / R030015) — failure leaves Subtree state untouched.
     2. Write new sublime-project file (R030017).
     3. Append config entry and rewrite subtree_config.json (R030018).
+    4. Copy gitignored directories from source (R030021 / R040021).
 
     Raises GitError on git failure (no Subtree files written), OSError on a
-    later write failure (worktree dir already exists on disk).
+    later write failure (worktree dir already exists on disk). Returns a list
+    of warnings from step 4 — non-empty lists do not roll back steps 1-3
+    (R030022 / R040022).
     """
     # R010002: branches with '/' produce nested paths under worktrees/. Ensure
     # the parent directory exists before invoking git (git already does this,
@@ -319,6 +484,10 @@ def _do_create(source_dir, source_name, source_template,
         "project_file": project_filename,
     })
     _write_json(os.path.join(root, CONFIG_FILENAME), config)
+
+    return _copy_listed_directories(
+        source_dir, new_worktree_dir, copy_directories, progress=copy_progress,
+    )
 
 
 def _find_main_worktree(root, config):
@@ -599,6 +768,27 @@ def _identify_current_worktree(folder, root, config):
     return None
 
 
+def _status_progress_callback(op_label):
+    """Return a `progress(entry, done, total)` callback that posts a fraction
+    plus a simple ASCII bar to Sublime's status bar. `op_label` prefixes the
+    message (e.g. "Create" → "Subtree (Create): copying .venv [###  ] 60/100").
+    """
+    bar_width = 12
+
+    def _cb(entry, done, total):
+        if total > 0:
+            filled = (done * bar_width) // total
+        else:
+            filled = bar_width
+        bar = "[" + ("#" * filled) + (" " * (bar_width - filled)) + "]"
+        sublime.status_message(
+            "Subtree ({}): copying {} {} {}/{}".format(
+                op_label, entry, bar, done, total,
+            )
+        )
+    return _cb
+
+
 def _open_project_and_close(window, project_path, op_label):
     """Open `project_path` via `subl --project` and close `window` (R020010 / R030019)."""
     try:
@@ -802,10 +992,12 @@ class SubtreeCreateCommand(sublime_plugin.WindowCommand):
             return
 
         try:
-            _do_create(
+            warnings = _do_create(
                 source_dir, source_name, source_template,
                 new_worktree_dir, new_project_path,
                 branch, base_branch, project_filename, root, config,
+                copy_directories=_get_copy_directories(config),
+                copy_progress=_status_progress_callback("Create"),
             )
         except GitError as e:
             sublime.error_message(
@@ -819,6 +1011,10 @@ class SubtreeCreateCommand(sublime_plugin.WindowCommand):
             )
             return
 
+        if warnings:
+            sublime.message_dialog(
+                "Subtree: Create finished with warnings (R030022):\n\n" + "\n".join(warnings)
+            )
         sublime.set_timeout(
             lambda: _open_project_and_close(self.window, new_project_path, "Create"), 0
         )
@@ -958,8 +1154,11 @@ class SubtreeOpenCommand(sublime_plugin.WindowCommand):
         # R040015 / R040016: base ref is None for local, the remote ref for remote-only.
         base_branch = None if candidate["remote"] is None else candidate["ref"]
 
+        # R040021: directories are copied from the template-source worktree, not main.
+        template_dir = os.path.join(root, WORKTREES_DIRNAME, template_name)
+
         try:
-            _do_create(
+            warnings = _do_create(
                 main_dir, template_name, source_template,
                 new_worktree_dir, new_project_path,
                 branch, base_branch, project_filename, root, config,
@@ -976,6 +1175,18 @@ class SubtreeOpenCommand(sublime_plugin.WindowCommand):
             )
             return
 
+        # R040021: invoked here (rather than via `_do_create`'s copy hook) because the
+        # copy source is the template-source worktree, while `_do_create`'s `source_dir`
+        # is the main worktree (the git base, per R040015 / R040016).
+        warnings = warnings + _copy_listed_directories(
+            template_dir, new_worktree_dir, _get_copy_directories(config),
+            progress=_status_progress_callback("Open"),
+        )
+
+        if warnings:
+            sublime.message_dialog(
+                "Subtree: Open finished with warnings (R040022):\n\n" + "\n".join(warnings)
+            )
         sublime.set_timeout(
             lambda: _open_project_and_close(self.window, new_project_path, "Open"), 0
         )

@@ -623,5 +623,407 @@ class TestDoCreate(unittest.TestCase):
                 subtree._load_source_template(source_project)
 
 
+class TestIsValidRelativeSubpath(unittest.TestCase):
+    """`settings.copy_directories` entries must be POSIX-style relative subpaths."""
+
+    def test_accepts_simple_name(self):
+        self.assertTrue(subtree._is_valid_relative_subpath(".venv"))
+
+    def test_accepts_nested(self):
+        self.assertTrue(subtree._is_valid_relative_subpath("a/b/c"))
+
+    def test_rejects_empty(self):
+        self.assertFalse(subtree._is_valid_relative_subpath(""))
+
+    def test_rejects_absolute(self):
+        self.assertFalse(subtree._is_valid_relative_subpath("/abs"))
+
+    def test_rejects_backslash(self):
+        self.assertFalse(subtree._is_valid_relative_subpath("a\\b"))
+
+    def test_rejects_control_chars(self):
+        self.assertFalse(subtree._is_valid_relative_subpath("a\nb"))
+        self.assertFalse(subtree._is_valid_relative_subpath("a\x00b"))
+
+    def test_rejects_dot_segments(self):
+        self.assertFalse(subtree._is_valid_relative_subpath("./foo"))
+        self.assertFalse(subtree._is_valid_relative_subpath("foo/./bar"))
+        self.assertFalse(subtree._is_valid_relative_subpath("../foo"))
+        self.assertFalse(subtree._is_valid_relative_subpath("foo/../bar"))
+
+    def test_rejects_doubled_or_trailing_slash(self):
+        self.assertFalse(subtree._is_valid_relative_subpath("foo//bar"))
+        self.assertFalse(subtree._is_valid_relative_subpath("foo/"))
+
+
+class TestReadConfigSettings(unittest.TestCase):
+    """R030004 — settings.copy_directories shape validation."""
+
+    def _write(self, root, data):
+        with open(os.path.join(root, subtree.CONFIG_FILENAME), "w") as f:
+            json.dump(data, f)
+
+    def _base_config(self):
+        return {
+            "meta_information": {"repository_name": "my_app", "main_worktree": "master"},
+            "worktrees": [
+                {"name": "master", "created_from": None,
+                 "project_file": "my_app_master.sublime-project"},
+            ],
+        }
+
+    def test_accepts_missing_settings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._write(tmp, self._base_config())
+            subtree._read_config(tmp)  # must not raise
+
+    def test_accepts_empty_settings_object(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data = self._base_config()
+            data["settings"] = {}
+            self._write(tmp, data)
+            subtree._read_config(tmp)
+
+    def test_accepts_valid_copy_directories(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data = self._base_config()
+            data["settings"] = {"copy_directories": [".venv", "build/cache"]}
+            self._write(tmp, data)
+            parsed = subtree._read_config(tmp)
+            self.assertEqual(
+                subtree._get_copy_directories(parsed), [".venv", "build/cache"]
+            )
+
+    def test_rejects_non_object_settings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data = self._base_config()
+            data["settings"] = ["bad"]
+            self._write(tmp, data)
+            with self.assertRaises(ValueError):
+                subtree._read_config(tmp)
+
+    def test_rejects_non_list_copy_directories(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data = self._base_config()
+            data["settings"] = {"copy_directories": ".venv"}
+            self._write(tmp, data)
+            with self.assertRaises(ValueError):
+                subtree._read_config(tmp)
+
+    def test_rejects_non_string_entry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data = self._base_config()
+            data["settings"] = {"copy_directories": [".venv", 42]}
+            self._write(tmp, data)
+            with self.assertRaises(ValueError):
+                subtree._read_config(tmp)
+
+    def test_rejects_absolute_entry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data = self._base_config()
+            data["settings"] = {"copy_directories": ["/abs"]}
+            self._write(tmp, data)
+            with self.assertRaises(ValueError):
+                subtree._read_config(tmp)
+
+    def test_rejects_dotdot_entry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data = self._base_config()
+            data["settings"] = {"copy_directories": ["../escape"]}
+            self._write(tmp, data)
+            with self.assertRaises(ValueError):
+                subtree._read_config(tmp)
+
+
+class TestIsGitignored(unittest.TestCase):
+    """R030021 step 2 — check-ignore wrapper."""
+
+    def test_returns_true_for_gitignored_entry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _init_git_repo(tmp)
+            with open(os.path.join(tmp, ".gitignore"), "w") as f:
+                f.write(".venv/\n")
+            # `.venv/` is a directory-only pattern, so the path must actually
+            # exist as a directory for `git check-ignore` to match it.
+            os.mkdir(os.path.join(tmp, ".venv"))
+            self.assertTrue(subtree._is_gitignored(tmp, ".venv"))
+
+    def test_returns_false_for_tracked_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _init_git_repo(tmp)
+            # README.md is committed by _init_git_repo.
+            self.assertFalse(subtree._is_gitignored(tmp, "README.md"))
+
+    def test_returns_false_for_unignored_untracked_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _init_git_repo(tmp)
+            self.assertFalse(subtree._is_gitignored(tmp, "some_dir"))
+
+
+class TestCopyListedDirectories(unittest.TestCase):
+    """R030021 — directory-copy helper, exercised against real on-disk repos."""
+
+    def _add_gitignore(self, worktree_dir, lines):
+        with open(os.path.join(worktree_dir, ".gitignore"), "w") as f:
+            f.write("\n".join(lines) + "\n")
+        subprocess.run(
+            ["git", "-C", worktree_dir, "add", ".gitignore"],
+            check=True, capture_output=True,
+        )
+        subprocess.run(
+            ["git", "-C", worktree_dir, "commit", "-q", "-m", "ignore"],
+            check=True, capture_output=True,
+        )
+
+    def test_silent_skip_when_source_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _init_git_repo(tmp)
+            new = os.path.join(tmp, "new")
+            os.mkdir(new)
+            warnings = subtree._copy_listed_directories(tmp, new, [".venv"])
+            self.assertEqual(warnings, [])
+            self.assertFalse(os.path.exists(os.path.join(new, ".venv")))
+
+    def test_copies_gitignored_directory_recursively(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _init_git_repo(tmp)
+            self._add_gitignore(tmp, [".venv/"])
+            os.makedirs(os.path.join(tmp, ".venv", "lib"))
+            with open(os.path.join(tmp, ".venv", "marker.txt"), "w") as f:
+                f.write("hello")
+            with open(os.path.join(tmp, ".venv", "lib", "deep.txt"), "w") as f:
+                f.write("deep")
+
+            new = os.path.join(tmp, "new")
+            os.mkdir(new)
+            warnings = subtree._copy_listed_directories(tmp, new, [".venv"])
+
+            self.assertEqual(warnings, [])
+            with open(os.path.join(new, ".venv", "marker.txt")) as f:
+                self.assertEqual(f.read(), "hello")
+            with open(os.path.join(new, ".venv", "lib", "deep.txt")) as f:
+                self.assertEqual(f.read(), "deep")
+
+    def test_preserves_symlinks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _init_git_repo(tmp)
+            self._add_gitignore(tmp, [".venv/"])
+            os.makedirs(os.path.join(tmp, ".venv"))
+            os.symlink("/etc/hostname", os.path.join(tmp, ".venv", "link"))
+
+            new = os.path.join(tmp, "new")
+            os.mkdir(new)
+            warnings = subtree._copy_listed_directories(tmp, new, [".venv"])
+
+            self.assertEqual(warnings, [])
+            link = os.path.join(new, ".venv", "link")
+            self.assertTrue(os.path.islink(link))
+            self.assertEqual(os.readlink(link), "/etc/hostname")
+
+    def test_warns_when_entry_not_gitignored(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _init_git_repo(tmp)
+            # Create a directory that is NOT ignored.
+            os.makedirs(os.path.join(tmp, "tracked_dir"))
+            with open(os.path.join(tmp, "tracked_dir", "f.txt"), "w") as f:
+                f.write("x")
+
+            new = os.path.join(tmp, "new")
+            os.mkdir(new)
+            warnings = subtree._copy_listed_directories(tmp, new, ["tracked_dir"])
+
+            self.assertEqual(len(warnings), 1)
+            self.assertIn("not gitignored", warnings[0])
+            self.assertIn("tracked_dir", warnings[0])
+            self.assertFalse(os.path.exists(os.path.join(new, "tracked_dir")))
+
+    def test_warns_when_target_already_exists(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _init_git_repo(tmp)
+            self._add_gitignore(tmp, [".venv/"])
+            os.makedirs(os.path.join(tmp, ".venv"))
+            with open(os.path.join(tmp, ".venv", "marker.txt"), "w") as f:
+                f.write("source")
+
+            new = os.path.join(tmp, "new")
+            os.makedirs(os.path.join(new, ".venv"))  # pre-existing target
+            with open(os.path.join(new, ".venv", "marker.txt"), "w") as f:
+                f.write("existing")
+
+            warnings = subtree._copy_listed_directories(tmp, new, [".venv"])
+
+            self.assertEqual(len(warnings), 1)
+            self.assertIn("already exists", warnings[0])
+            with open(os.path.join(new, ".venv", "marker.txt")) as f:
+                self.assertEqual(f.read(), "existing")  # not overwritten
+
+    def test_empty_list_is_noop(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _init_git_repo(tmp)
+            new = os.path.join(tmp, "new")
+            os.mkdir(new)
+            self.assertEqual(subtree._copy_listed_directories(tmp, new, []), [])
+
+    def test_progress_callback_reports_done_and_total(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _init_git_repo(tmp)
+            self._add_gitignore(tmp, [".venv/"])
+            os.makedirs(os.path.join(tmp, ".venv", "lib"))
+            for name in ("a.txt", "b.txt"):
+                with open(os.path.join(tmp, ".venv", name), "w") as f:
+                    f.write("x")
+            with open(os.path.join(tmp, ".venv", "lib", "c.txt"), "w") as f:
+                f.write("x")
+
+            new = os.path.join(tmp, "new")
+            os.mkdir(new)
+
+            calls = []
+
+            def progress(entry, done, total):
+                calls.append((entry, done, total))
+
+            warnings = subtree._copy_listed_directories(
+                tmp, new, [".venv"], progress=progress,
+            )
+
+            self.assertEqual(warnings, [])
+            # First tick is (".venv", 0, 3); last tick must be (".venv", 3, 3).
+            self.assertEqual(calls[0], (".venv", 0, 3))
+            self.assertEqual(calls[-1], (".venv", 3, 3))
+            # `done` should be monotonically non-decreasing and bounded by total.
+            for entry, done, total in calls:
+                self.assertEqual(entry, ".venv")
+                self.assertEqual(total, 3)
+                self.assertGreaterEqual(done, 0)
+                self.assertLessEqual(done, 3)
+            done_series = [c[1] for c in calls]
+            self.assertEqual(done_series, sorted(done_series))
+
+    def test_progress_optional_does_not_break_copy(self):
+        """Sanity: without a progress callback the copy still completes."""
+        with tempfile.TemporaryDirectory() as tmp:
+            _init_git_repo(tmp)
+            self._add_gitignore(tmp, [".venv/"])
+            os.makedirs(os.path.join(tmp, ".venv"))
+            with open(os.path.join(tmp, ".venv", "f.txt"), "w") as f:
+                f.write("data")
+            new = os.path.join(tmp, "new")
+            os.mkdir(new)
+            self.assertEqual(subtree._copy_listed_directories(tmp, new, [".venv"]), [])
+            with open(os.path.join(new, ".venv", "f.txt")) as f:
+                self.assertEqual(f.read(), "data")
+
+    def test_creates_intermediate_dirs_for_nested_entry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _init_git_repo(tmp)
+            self._add_gitignore(tmp, ["build/cache/"])
+            os.makedirs(os.path.join(tmp, "build", "cache"))
+            with open(os.path.join(tmp, "build", "cache", "f.txt"), "w") as f:
+                f.write("x")
+
+            new = os.path.join(tmp, "new")
+            os.mkdir(new)
+            warnings = subtree._copy_listed_directories(tmp, new, ["build/cache"])
+
+            self.assertEqual(warnings, [])
+            with open(os.path.join(new, "build", "cache", "f.txt")) as f:
+                self.assertEqual(f.read(), "x")
+
+
+class TestDoCreateCopiesDirectories(unittest.TestCase):
+    """R030021 / R030022 — full create with copy_directories configured."""
+
+    def _set_copy_directories(self, root, entries):
+        with open(os.path.join(root, subtree.CONFIG_FILENAME)) as f:
+            data = json.load(f)
+        data["settings"] = {"copy_directories": entries}
+        with open(os.path.join(root, subtree.CONFIG_FILENAME), "w") as f:
+            json.dump(data, f, indent=4)
+            f.write("\n")
+        return data
+
+    def test_create_copies_gitignored_dir_from_source(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, _ = _make_subtree_repo(tmp)
+            source_dir = os.path.join(root, "worktrees", "master")
+            # Set up the source: gitignored .venv with a marker file.
+            with open(os.path.join(source_dir, ".gitignore"), "w") as f:
+                f.write(".venv/\n")
+            subprocess.run(
+                ["git", "-C", source_dir, "add", ".gitignore"],
+                check=True, capture_output=True,
+            )
+            subprocess.run(
+                ["git", "-C", source_dir, "commit", "-q", "-m", "ignore"],
+                check=True, capture_output=True,
+            )
+            os.makedirs(os.path.join(source_dir, ".venv"))
+            with open(os.path.join(source_dir, ".venv", "marker.txt"), "w") as f:
+                f.write("source-marker")
+
+            config = self._set_copy_directories(root, [".venv"])
+            repo_name = config["meta_information"]["repository_name"]
+            new_worktree_dir = os.path.join(root, "worktrees", "feature_1")
+            project_filename = "{}_{}.sublime-project".format(repo_name, "feature_1")
+            new_project_path = os.path.join(
+                root, "sublime_projects", project_filename
+            )
+            source_project_path = os.path.join(
+                root, "sublime_projects", "my_app_master.sublime-project"
+            )
+            source_template = subtree._load_source_template(source_project_path)
+            base_branch, _ = subtree._resolve_base_branch(source_dir, "feature_1")
+
+            warnings = subtree._do_create(
+                source_dir, "master", source_template,
+                new_worktree_dir, new_project_path,
+                "feature_1", base_branch, project_filename, root, config,
+                copy_directories=subtree._get_copy_directories(config),
+            )
+
+            self.assertEqual(warnings, [])
+            with open(os.path.join(new_worktree_dir, ".venv", "marker.txt")) as f:
+                self.assertEqual(f.read(), "source-marker")
+
+    def test_create_warns_and_skips_non_ignored_entry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, _ = _make_subtree_repo(tmp)
+            source_dir = os.path.join(root, "worktrees", "master")
+            # Create an unignored directory in the source.
+            os.makedirs(os.path.join(source_dir, "cache_dir"))
+            with open(os.path.join(source_dir, "cache_dir", "x.txt"), "w") as f:
+                f.write("x")
+
+            config = self._set_copy_directories(root, ["cache_dir"])
+            repo_name = config["meta_information"]["repository_name"]
+            new_worktree_dir = os.path.join(root, "worktrees", "feature_1")
+            project_filename = "{}_{}.sublime-project".format(repo_name, "feature_1")
+            new_project_path = os.path.join(
+                root, "sublime_projects", project_filename
+            )
+            source_template = subtree._load_source_template(os.path.join(
+                root, "sublime_projects", "my_app_master.sublime-project"
+            ))
+            base_branch, _ = subtree._resolve_base_branch(source_dir, "feature_1")
+
+            warnings = subtree._do_create(
+                source_dir, "master", source_template,
+                new_worktree_dir, new_project_path,
+                "feature_1", base_branch, project_filename, root, config,
+                copy_directories=subtree._get_copy_directories(config),
+            )
+
+            self.assertEqual(len(warnings), 1)
+            self.assertIn("not gitignored", warnings[0])
+            # R030022: worktree, project file, and config entry are still in place.
+            self.assertTrue(os.path.isdir(new_worktree_dir))
+            self.assertTrue(os.path.isfile(new_project_path))
+            with open(os.path.join(root, subtree.CONFIG_FILENAME)) as f:
+                new_config = json.load(f)
+            self.assertEqual(new_config["worktrees"][-1]["name"], "feature_1")
+            self.assertFalse(os.path.exists(os.path.join(new_worktree_dir, "cache_dir")))
+
+
 if __name__ == "__main__":
     unittest.main()

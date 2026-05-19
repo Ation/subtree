@@ -50,6 +50,12 @@ Numbering scheme: `R<section><index>`, where `<section>` is a two-digit section 
 - **R030018** — `create` appends a new entry to `worktrees[]` in [`subtree_config.json`](schemas/subtree_config.md) with `name = <branch>`, `created_from = <source-worktree-name>`, and `project_file = <repository_name>_<branch>.sublime-project`. The file is rewritten with the same 4-space indent + trailing newline format `init` uses.
 - **R030019** — After a successful `create`, Subtree opens the new sublime-project file and closes the originating window (mirroring [R020010](#2-init-operation)).
 - **R030020** — If the `git worktree add` invocation fails, `create` surfaces git's stderr to the user and writes neither the new sublime-project file nor the config entry. Any partial directory created by git is left on disk for manual inspection.
+- **R030021** — After [R030018](#3-create-operation) succeeds, `create` copies each entry in `settings.copy_directories` (see [Subtree config schema](schemas/subtree_config.md)) from the source worktree directory into the new worktree directory, in the order listed. For each entry:
+  1. If the entry does not exist in the source worktree, skip silently.
+  2. Otherwise check that the entry is ignored by git in the source worktree (`git -C <source-worktree-dir> check-ignore -q -- <entry>`). If it is not ignored, skip and surface a warning naming the entry and the reason. This prevents Subtree from clobbering git-tracked content in the new worktree.
+  3. Otherwise, if the entry already exists at the target path inside the new worktree, skip and surface a warning. This is defensive — gitignored entries should not exist after [R030014](#3-create-operation) / [R030015](#3-create-operation) — but Subtree must not overwrite if they somehow do.
+  4. Otherwise copy the directory recursively into the new worktree at the same relative path, preserving symlinks as symlinks. On `OSError` during a copy, surface a warning naming the entry and the error; do not abort the operation.
+- **R030022** — Warnings produced by [R030021](#3-create-operation) do not roll back [R030014](#3-create-operation)–[R030018](#3-create-operation). The new worktree, sublime-project file, and config entry remain. Any warnings are surfaced to the user in a single end-of-operation message before [R030019](#3-create-operation) opens the new project.
 
 ## 4. Open operation
 
@@ -75,6 +81,8 @@ Numbering scheme: `R<section><index>`, where `<section>` is a two-digit section 
 - **R040018** — `open` appends a new entry to `worktrees[]` in [`subtree_config.json`](schemas/subtree_config.md) with `name = <local_name>`, `created_from = <template-source-name>`, and `project_file` computed per [R010003](#1-restrictions-and-general-requirements).
 - **R040019** — After a successful `open`, Subtree opens the new sublime-project file and closes the originating window (mirroring [R020010](#2-init-operation) / [R030019](#3-create-operation)).
 - **R040020** — If `git worktree add` fails, `open` surfaces git's stderr to the user and writes neither the new sublime-project file nor the config entry. Any partial directory created by git is left on disk for manual inspection.
+- **R040021** — Mirrors [R030021](#3-create-operation): after [R040018](#4-open-operation) succeeds, `open` copies each entry in `settings.copy_directories` from the **template-source worktree** (the worktree picked in [R040013](#4-open-operation), whose project file was used as the template) into the new worktree, applying the same missing / not-ignored / target-exists / OSError rules.
+- **R040022** — Mirrors [R030022](#3-create-operation): warnings produced by [R040021](#4-open-operation) do not roll back the operation; they are surfaced in a single end-of-operation message before [R040019](#4-open-operation).
 
 ## 5. Switch operation
 

@@ -12,6 +12,7 @@ def _install_sublime_stubs():
     if "sublime" not in sys.modules:
         sublime = types.ModuleType("sublime")
         sublime.error_message = lambda msg: None
+        sublime.message_dialog = lambda msg: None
         sublime.status_message = lambda msg: None
         sublime.set_timeout = lambda fn, delay=0: fn()
         sublime.set_timeout_async = lambda fn, delay=0: fn()
