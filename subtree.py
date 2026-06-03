@@ -739,6 +739,10 @@ def _do_remove(root, config, entry, worktree_dir, main_dir):
     project_path = os.path.join(root, SUBLIME_PROJECTS_DIRNAME, entry["project_file"])
     os.remove(project_path)
 
+    workspace_path = project_path.replace(".sublime-project", ".sublime-workspace")
+    if os.path.isfile(workspace_path):
+        os.remove(workspace_path)
+
     config["worktrees"] = [
         wt for wt in config["worktrees"] if wt["name"] != entry["name"]
     ]
