@@ -930,6 +930,84 @@ class TestCopyListedDirectories(unittest.TestCase):
             with open(os.path.join(new, "build", "cache", "f.txt")) as f:
                 self.assertEqual(f.read(), "x")
 
+    def test_wildcard_expands_to_matching_directories(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _init_git_repo(tmp)
+            self._add_gitignore(tmp, ["build/"])
+            for name in ("foo-src", "bar-src"):
+                os.makedirs(os.path.join(tmp, "build", "_deps", name))
+                with open(os.path.join(tmp, "build", "_deps", name, "f.txt"), "w") as f:
+                    f.write(name)
+            # A non-matching sibling that must NOT be copied.
+            os.makedirs(os.path.join(tmp, "build", "_deps", "foo-build"))
+            with open(os.path.join(tmp, "build", "_deps", "foo-build", "f.txt"), "w") as f:
+                f.write("nope")
+
+            new = os.path.join(tmp, "new")
+            os.mkdir(new)
+            warnings = subtree._copy_listed_directories(
+                tmp, new, ["build/_deps/*-src"],
+            )
+
+            self.assertEqual(warnings, [])
+            for name in ("foo-src", "bar-src"):
+                with open(os.path.join(new, "build", "_deps", name, "f.txt")) as f:
+                    self.assertEqual(f.read(), name)
+            self.assertFalse(
+                os.path.exists(os.path.join(new, "build", "_deps", "foo-build"))
+            )
+
+    def test_wildcard_matching_nothing_is_silent_noop(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _init_git_repo(tmp)
+            self._add_gitignore(tmp, ["build/"])
+            os.makedirs(os.path.join(tmp, "build", "_deps"))
+
+            new = os.path.join(tmp, "new")
+            os.mkdir(new)
+            warnings = subtree._copy_listed_directories(
+                tmp, new, ["build/_deps/*-src"],
+            )
+
+            self.assertEqual(warnings, [])
+            self.assertFalse(os.path.exists(os.path.join(new, "build")))
+
+    def test_wildcard_ignores_non_directory_matches(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _init_git_repo(tmp)
+            self._add_gitignore(tmp, ["build/"])
+            os.makedirs(os.path.join(tmp, "build", "lib-src"))
+            with open(os.path.join(tmp, "build", "lib-src", "f.txt"), "w") as f:
+                f.write("dir")
+            # A file matching the same pattern must be skipped (dirs only).
+            with open(os.path.join(tmp, "build", "notes-src"), "w") as f:
+                f.write("file")
+
+            new = os.path.join(tmp, "new")
+            os.mkdir(new)
+            warnings = subtree._copy_listed_directories(tmp, new, ["build/*-src"])
+
+            self.assertEqual(warnings, [])
+            self.assertTrue(os.path.isdir(os.path.join(new, "build", "lib-src")))
+            self.assertFalse(os.path.exists(os.path.join(new, "build", "notes-src")))
+
+    def test_wildcard_warns_when_match_not_gitignored(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _init_git_repo(tmp)
+            # build/ itself is tracked, so matches are not gitignored.
+            os.makedirs(os.path.join(tmp, "build", "foo-src"))
+            with open(os.path.join(tmp, "build", "foo-src", "f.txt"), "w") as f:
+                f.write("x")
+
+            new = os.path.join(tmp, "new")
+            os.mkdir(new)
+            warnings = subtree._copy_listed_directories(tmp, new, ["build/*-src"])
+
+            self.assertEqual(len(warnings), 1)
+            self.assertIn("not gitignored", warnings[0])
+            self.assertIn("foo-src", warnings[0])
+            self.assertFalse(os.path.exists(os.path.join(new, "build", "foo-src")))
+
 
 class TestDoCreateCopiesDirectories(unittest.TestCase):
     """R030021 / R030022 — full create with copy_directories configured."""

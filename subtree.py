@@ -1,4 +1,5 @@
 import copy
+import glob
 import json
 import os
 import re
@@ -16,6 +17,7 @@ SUBLIME_PROJECTS_DIRNAME = "sublime_projects"
 RESERVED_DIRNAMES = (WORKTREES_DIRNAME, SUBLIME_PROJECTS_DIRNAME)
 
 _INVALID_REPO_NAME_RE = re.compile(r"[\\/]|[\x00-\x1f]")
+_COPY_GLOB_MAGIC = re.compile(r"[*?\[]")
 
 
 class GitError(RuntimeError):
@@ -275,6 +277,28 @@ def _count_copyable_files(path):
     return n
 
 
+def _expand_copy_entry(source_dir, rel):
+    """Expand a single `copy_directories` entry into concrete relative paths.
+
+    Entries containing glob magic (`*`, `?`, `[...]`) are matched against
+    `source_dir`; only matching directories are kept, sorted for deterministic
+    ordering. A wildcard entry that matches nothing yields an empty list (a
+    silent skip, mirroring a missing literal entry per R030021.1). Non-wildcard
+    entries are returned verbatim as a single-element list regardless of whether
+    they exist, so the caller's missing-entry handling still applies.
+
+    Returned paths use `/` separators, matching the entry format.
+    """
+    if not _COPY_GLOB_MAGIC.search(rel):
+        return [rel]
+    pattern = os.path.join(source_dir, *rel.split("/"))
+    expanded = []
+    for match in sorted(glob.glob(pattern)):
+        if os.path.isdir(match):
+            expanded.append(os.path.relpath(match, source_dir).replace(os.sep, "/"))
+    return expanded
+
+
 def _copy_listed_directories(source_dir, new_dir, entries, progress=None):
     """R030021 / R040021: copy each gitignored entry from `source_dir` to `new_dir`.
 
@@ -283,13 +307,20 @@ def _copy_listed_directories(source_dir, new_dir, entries, progress=None):
     is the only failure channel so the caller can continue past R030019 /
     R040019 (R030022 / R040022).
 
+    Entries may contain glob wildcards (e.g. `build/_deps/*-src`); each is
+    expanded against `source_dir` into the matching directories before copying
+    (see `_expand_copy_entry`).
+
     If `progress` is a callable, it is invoked as `progress(entry, done, total)`
     before each entry starts (`done=0`), periodically while files are copied
     (at most ~10 Hz), and once at completion (`done==total`). Symlink files
     are not counted in `total` (see `_count_copyable_files`).
     """
     warnings = []
-    for rel in entries:
+    expanded_entries = []
+    for entry in entries:
+        expanded_entries.extend(_expand_copy_entry(source_dir, entry))
+    for rel in expanded_entries:
         parts = rel.split("/")
         src = os.path.join(source_dir, *parts)
         if not os.path.isdir(src):

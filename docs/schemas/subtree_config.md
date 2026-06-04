@@ -62,6 +62,8 @@ Repository-wide behaviour knobs. The whole object is optional; an absent or empt
 
 Relative directory paths (relative to a worktree's root) that Subtree copies from the source worktree into the new worktree during [`create`](../requirements.md#3-create-operation) and [`open`](../requirements.md#4-open-operation). Each entry must be a relative path with no empty segments, no `.` or `..` segments, and no leading `/` or `\`.
 
+An entry may contain glob wildcards (`*`, `?`, `[...]`), e.g. `build/_deps/*-src`. Wildcard entries are expanded against the source worktree at copy time into the set of matching **directories**; non-directory matches are ignored, and a pattern matching nothing is skipped silently. As with shell globbing, `*` does not match across `/` and does not match leading-dot segments. Matches are processed in sorted order.
+
 At copy time (see [R030021](../requirements.md#3-create-operation) / [R040021](../requirements.md#4-open-operation)):
 
 - Entries missing from the source worktree are skipped silently.
