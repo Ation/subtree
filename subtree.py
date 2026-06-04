@@ -827,8 +827,13 @@ def _status_progress_callback(op_label):
     return _cb
 
 
-def _open_project_and_close(window, project_path, op_label):
-    """Open `project_path` via `subl --project` and close `window` (R020010 / R030019)."""
+def _open_project_and_close(window, project_path, op_label, close_window=True):
+    """Open `project_path` via `subl --project`.
+
+    Closes the originating `window` only when `close_window` is True (R020010
+    for `init`, R050009 for `switch`). `create` (R030019) and `open` (R040019)
+    open the new project in a new window and leave the originating window open.
+    """
     try:
         subprocess.Popen(["subl", "--project", project_path])
     except FileNotFoundError:
@@ -837,7 +842,8 @@ def _open_project_and_close(window, project_path, op_label):
             "Open the new project manually:\n{}".format(op_label, project_path)
         )
         return
-    window.run_command("close_window")
+    if close_window:
+        window.run_command("close_window")
 
 
 class SubtreeInitCommand(sublime_plugin.WindowCommand):
@@ -1054,7 +1060,10 @@ class SubtreeCreateCommand(sublime_plugin.WindowCommand):
                 "Subtree: Create finished with warnings (R030022):\n\n" + "\n".join(warnings)
             )
         sublime.set_timeout(
-            lambda: _open_project_and_close(self.window, new_project_path, "Create"), 0
+            lambda: _open_project_and_close(
+                self.window, new_project_path, "Create", close_window=False
+            ),
+            0,
         )
 
 
@@ -1226,7 +1235,10 @@ class SubtreeOpenCommand(sublime_plugin.WindowCommand):
                 "Subtree: Open finished with warnings (R040022):\n\n" + "\n".join(warnings)
             )
         sublime.set_timeout(
-            lambda: _open_project_and_close(self.window, new_project_path, "Open"), 0
+            lambda: _open_project_and_close(
+                self.window, new_project_path, "Open", close_window=False
+            ),
+            0,
         )
 
 
