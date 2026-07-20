@@ -781,6 +781,63 @@ def _do_remove(root, config, entry, worktree_dir, main_dir):
     return cleanup_ran
 
 
+def _find_stale_worktrees(root, config):
+    """R080005: return the `worktrees[]` entries whose worktree directory is
+    missing on disk, excluding the main worktree (R010001 — never pruned).
+
+    Order follows `worktrees[]`; the main worktree is skipped even if its own
+    directory is missing.
+    """
+    main_name = config["meta_information"]["main_worktree"]
+    stale = []
+    for wt in config["worktrees"]:
+        if wt["name"] == main_name:
+            continue  # R010001: never prune the main worktree.
+        wt_dir = os.path.join(root, WORKTREES_DIRNAME, wt["name"])
+        if not os.path.isdir(wt_dir):
+            stale.append(wt)
+    return stale
+
+
+def _do_prune(root, config, stale_entries):
+    """R080007 / R080008: delete each stale entry's sublime-project (and matching
+    sublime-workspace) file, drop the entries from `worktrees[]`, and rewrite
+    subtree_config.json.
+
+    Returns (results, warnings):
+      results  -- list of {"name": str, "removed_files": [abs path, ...]} per
+                  pruned entry, in `stale_entries` order.
+      warnings -- human-readable strings for files that could not be deleted.
+
+    Config entries are dropped regardless of file-deletion outcome: the worktree
+    directory is already gone (R080005), so the entry is stale by definition.
+    File-deletion failures are collected as warnings, not aborts (R080010).
+    Raises OSError only if rewriting subtree_config.json fails.
+    """
+    results = []
+    warnings = []
+    projects_dir = os.path.join(root, SUBLIME_PROJECTS_DIRNAME)
+    for entry in stale_entries:
+        removed_files = []
+        project_path = os.path.join(projects_dir, entry["project_file"])
+        workspace_path = project_path.replace(".sublime-project", ".sublime-workspace")
+        for path in (project_path, workspace_path):
+            if os.path.isfile(path):
+                try:
+                    os.remove(path)
+                    removed_files.append(path)
+                except OSError as e:
+                    warnings.append("prune: failed to delete {}: {}".format(path, e))
+        results.append({"name": entry["name"], "removed_files": removed_files})
+
+    stale_names = {e["name"] for e in stale_entries}
+    config["worktrees"] = [
+        wt for wt in config["worktrees"] if wt["name"] not in stale_names
+    ]
+    _write_json(os.path.join(root, CONFIG_FILENAME), config)
+    return results, warnings
+
+
 def _identify_current_worktree(folder, root, config):
     """R050005: return the name of the worktree containing `folder`, or None.
 
@@ -1429,3 +1486,67 @@ class SubtreeRemoveCommand(sublime_plugin.WindowCommand):
         sublime.status_message(
             "Subtree: removed worktree '{}'{}".format(entry["name"], suffix)
         )
+
+
+class SubtreePruneCommand(sublime_plugin.WindowCommand):
+    def run(self):
+        # R080001: must have a folder open.
+        folders = self.window.folders()
+        if not folders:
+            sublime.error_message(
+                "Subtree: Prune requires a folder open in the window (R080001)."
+            )
+            return
+
+        # R080002 / R080003: locate root.
+        root = _find_root(folders[0])
+        if root is None:
+            sublime.error_message(
+                "Subtree: No {} found at or above {} (R080003).".format(
+                    CONFIG_FILENAME, folders[0]
+                )
+            )
+            return
+
+        # R080004: read + validate config.
+        try:
+            config = _read_config(root)
+        except (OSError, ValueError) as e:
+            sublime.error_message("Subtree: {} (R080004)".format(e))
+            return
+
+        # R080005: find stale entries (missing worktree dir, excluding main).
+        stale = _find_stale_worktrees(root, config)
+
+        # R080006: nothing to do.
+        if not stale:
+            sublime.status_message(
+                "Subtree: nothing to prune (every managed worktree directory exists)."
+            )
+            return
+
+        try:
+            results, warnings = _do_prune(root, config, stale)
+        except OSError as e:
+            sublime.error_message(
+                "Subtree: Prune failed rewriting {}: {}.\n\n"
+                "Inspect {} manually (R080010).".format(CONFIG_FILENAME, e, root)
+            )
+            return
+
+        # R080009: report every pruned entry and deleted file to the console log.
+        for r in results:
+            print("Subtree (Prune): removed stale worktree entry '{}'".format(r["name"]))
+            for path in r["removed_files"]:
+                print("Subtree (Prune):   deleted {}".format(path))
+        for w in warnings:
+            print("Subtree (Prune): {}".format(w))
+
+        names = ", ".join(r["name"] for r in results)
+        summary = "Subtree: pruned {} stale worktree entr{} ({}).".format(
+            len(results), "y" if len(results) == 1 else "ies", names
+        )
+        if warnings:
+            sublime.message_dialog(summary + "\n\nWarnings:\n" + "\n".join(warnings))
+        else:
+            sublime.status_message(summary)
