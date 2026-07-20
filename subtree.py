@@ -838,6 +838,58 @@ def _do_prune(root, config, stale_entries):
     return results, warnings
 
 
+def _find_orphan_files(root, config):
+    """R080011: return absolute paths of files directly under sublime_projects/
+    that no `worktrees[]` entry references.
+
+    A `.sublime-project` file is referenced iff its basename equals some
+    `worktrees[].project_file`; a `.sublime-workspace` file is referenced iff the
+    matching `.sublime-project` basename is. The main worktree's files stay
+    referenced (its entry is never stale, R010001), so they are never orphaned.
+
+    Only the top level of sublime_projects/ is scanned — the directory is flat.
+    Paths are returned sorted for stable reporting.
+    """
+    referenced = {wt["project_file"] for wt in config["worktrees"]}
+    projects_dir = os.path.join(root, SUBLIME_PROJECTS_DIRNAME)
+    if not os.path.isdir(projects_dir):
+        return []
+    orphans = []
+    for name in os.listdir(projects_dir):
+        path = os.path.join(projects_dir, name)
+        if not os.path.isfile(path):
+            continue
+        if name.endswith(".sublime-project"):
+            project_name = name
+        elif name.endswith(".sublime-workspace"):
+            project_name = name[: -len(".sublime-workspace")] + ".sublime-project"
+        else:
+            continue  # not a project/workspace file — leave it alone.
+        if project_name not in referenced:
+            orphans.append(path)
+    return sorted(orphans)
+
+
+def _delete_orphan_files(orphan_paths):
+    """R080012: delete each orphaned file. Returns (removed, warnings):
+
+      removed   -- list of abs paths successfully deleted.
+      warnings  -- human-readable strings for files that could not be deleted.
+
+    A failed delete is a warning, not an abort (as in R080010). Touches only
+    sublime_projects/; subtree_config.json is not involved.
+    """
+    removed = []
+    warnings = []
+    for path in orphan_paths:
+        try:
+            os.remove(path)
+            removed.append(path)
+        except OSError as e:
+            warnings.append("prune: failed to delete {}: {}".format(path, e))
+    return removed, warnings
+
+
 def _identify_current_worktree(folder, root, config):
     """R050005: return the name of the worktree containing `folder`, or None.
 
@@ -1517,35 +1569,60 @@ class SubtreePruneCommand(sublime_plugin.WindowCommand):
 
         # R080005: find stale entries (missing worktree dir, excluding main).
         stale = _find_stale_worktrees(root, config)
+        # R080011: find orphaned files (against the config as it is now — before
+        # dropping stale entries — so stale entries' files are not double-counted).
+        orphans = _find_orphan_files(root, config)
 
         # R080006: nothing to do.
-        if not stale:
+        if not stale and not orphans:
             sublime.status_message(
-                "Subtree: nothing to prune (every managed worktree directory exists)."
+                "Subtree: nothing to prune (config and sublime_projects/ are in sync)."
             )
             return
 
-        try:
-            results, warnings = _do_prune(root, config, stale)
-        except OSError as e:
-            sublime.error_message(
-                "Subtree: Prune failed rewriting {}: {}.\n\n"
-                "Inspect {} manually (R080010).".format(CONFIG_FILENAME, e, root)
-            )
-            return
+        # R080007 / R080008: drop stale entries and delete their files (rewrites
+        # config). Skipped when there are no stale entries so the config is left
+        # untouched for an orphan-only prune.
+        results, warnings = [], []
+        if stale:
+            try:
+                results, warnings = _do_prune(root, config, stale)
+            except OSError as e:
+                sublime.error_message(
+                    "Subtree: Prune failed rewriting {}: {}.\n\n"
+                    "Inspect {} manually (R080010).".format(CONFIG_FILENAME, e, root)
+                )
+                return
+
+        # R080012: delete orphaned project/workspace files.
+        orphans_removed, orphan_warnings = _delete_orphan_files(orphans)
+        warnings.extend(orphan_warnings)
 
         # R080009: report every pruned entry and deleted file to the console log.
         for r in results:
             print("Subtree (Prune): removed stale worktree entry '{}'".format(r["name"]))
             for path in r["removed_files"]:
                 print("Subtree (Prune):   deleted {}".format(path))
+        for path in orphans_removed:
+            print("Subtree (Prune): deleted orphaned file {}".format(path))
         for w in warnings:
             print("Subtree (Prune): {}".format(w))
 
-        names = ", ".join(r["name"] for r in results)
-        summary = "Subtree: pruned {} stale worktree entr{} ({}).".format(
-            len(results), "y" if len(results) == 1 else "ies", names
-        )
+        parts = []
+        if results:
+            names = ", ".join(r["name"] for r in results)
+            parts.append(
+                "pruned {} stale worktree entr{} ({})".format(
+                    len(results), "y" if len(results) == 1 else "ies", names
+                )
+            )
+        if orphans_removed:
+            parts.append(
+                "deleted {} orphaned file{}".format(
+                    len(orphans_removed), "" if len(orphans_removed) == 1 else "s"
+                )
+            )
+        summary = "Subtree: {}.".format("; ".join(parts) if parts else "nothing to prune")
         if warnings:
             sublime.message_dialog(summary + "\n\nWarnings:\n" + "\n".join(warnings))
         else:

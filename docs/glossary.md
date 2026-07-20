@@ -47,6 +47,10 @@ Existing worktree selected by the user as the base for a new worktree, or as the
 
 In both cases, the chosen source worktree's name is recorded in [`subtree_config.json`](schemas/subtree_config.md) as `worktrees[].created_from` of the new entry.
 
+### Orphaned project/workspace file
+
+A `.sublime-project` or `.sublime-workspace` file in [`sublime_projects/`](structure.md) that no `worktrees[]` entry of [`subtree_config.json`](schemas/subtree_config.md) references — left behind, for example, by a hand-edited config or a worktree deleted along with its config entry but not its files. [`prune`](requirements.md#8-prune-operation) deletes orphaned files ([R080011](requirements.md#8-prune-operation)). Unlike a [stale entry](#stale-entry), an orphaned file has no config entry at all. The [main worktree](#main-worktree)'s files are always referenced and never orphaned ([R010001](requirements.md#1-restrictions-and-general-requirements)).
+
 ### Stale entry
 
 An entry in `worktrees[]` of [`subtree_config.json`](schemas/subtree_config.md) whose [worktree directory](#worktree-directory) no longer exists on disk — a dangling reference left behind when a worktree is deleted outside Subtree. [`prune`](requirements.md#8-prune-operation) removes stale entries and their leftover project/workspace files. The [main worktree](#main-worktree) is never treated as stale ([R010001](requirements.md#1-restrictions-and-general-requirements)).
