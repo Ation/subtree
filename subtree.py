@@ -672,6 +672,17 @@ def _check_upstream(worktree_dir):
     return {"status": "ok"}
 
 
+# R060017: Docker Compose files whose presence marks a directory as a stack
+# root. `docker compose down` in the directory auto-detects and applies any
+# override file, so we only need to know a directory holds one of these.
+COMPOSE_FILENAMES = (
+    "docker-compose.yml",
+    "docker-compose.yaml",
+    "compose.yml",
+    "compose.yaml",
+)
+
+
 def _find_pipfile_dirs(worktree_dir):
     """Yield every directory under `worktree_dir` that contains a `Pipfile`.
 
@@ -683,13 +694,26 @@ def _find_pipfile_dirs(worktree_dir):
             yield dirpath
 
 
-def _cleanup_worktree(worktree_dir):
+def _find_compose_dirs(worktree_dir):
+    """Yield every directory under `worktree_dir` that contains a Docker
+    Compose file (any name in `COMPOSE_FILENAMES`).
+
+    Pure file walk -- no subprocess invocation. Separated so the cleanup
+    logic can be unit-tested independently of docker.
+    """
+    compose_names = frozenset(COMPOSE_FILENAMES)
+    for dirpath, _dirnames, filenames in os.walk(worktree_dir):
+        if compose_names.intersection(filenames):
+            yield dirpath
+
+
+def _cleanup_pipenv_envs(worktree_dir):
     """R060012. Tear down pipenv envs for every Pipfile under `worktree_dir`.
 
     Returns True if cleanup ran (pipenv invocations performed for any
-    Pipfiles found), False if `pipenv` is not on PATH and cleanup was
-    skipped. Non-zero exit from `pipenv --rm` is ignored (treated as
-    'no env for this Pipfile').
+    Pipfiles found, or none were found), False if `pipenv` is not on PATH and
+    cleanup was skipped. Non-zero exit from `pipenv --rm` is ignored (treated
+    as 'no env for this Pipfile').
     """
     for pipfile_dir in _find_pipfile_dirs(worktree_dir):
         try:
@@ -701,6 +725,46 @@ def _cleanup_worktree(worktree_dir):
         except FileNotFoundError:
             return False
     return True
+
+
+def _cleanup_compose_stacks(worktree_dir):
+    """R060017. Tear down the Docker Compose stack for every compose file under
+    `worktree_dir` by running `docker compose down` in each containing
+    directory.
+
+    `down` is run with `-v`, so named volumes (and the data they hold) are
+    removed along with the stack -- this is destructive and not reversible.
+    Returns True if cleanup ran (docker invocations performed for any compose
+    files found, or none were found), False if `docker` is not on PATH and
+    cleanup was skipped. Non-zero exit from `docker compose down` is ignored
+    (treated as 'no running stack to remove').
+    """
+    for compose_dir in _find_compose_dirs(worktree_dir):
+        try:
+            subprocess.run(
+                ["docker", "compose", "down", "-v"],
+                cwd=compose_dir,
+                capture_output=True, text=True, check=False,
+            )
+        except FileNotFoundError:
+            return False
+    return True
+
+
+def _cleanup_worktree(worktree_dir):
+    """R060012 / R060017. Best-effort teardown of local dev state under
+    `worktree_dir`: pipenv environments and Docker Compose stacks.
+
+    Returns a dict ``{"pipenv": bool, "docker": bool}``. Each flag is True when
+    that tool's cleanup ran (including the no-op case where nothing was found),
+    and False when the tool is not on PATH and its cleanup was skipped. The two
+    are independent -- a missing `pipenv` does not skip the compose teardown,
+    and a missing `docker` does not skip the pipenv teardown.
+    """
+    return {
+        "pipenv": _cleanup_pipenv_envs(worktree_dir),
+        "docker": _cleanup_compose_stacks(worktree_dir),
+    }
 
 
 def _git_worktree_remove(git_cwd, worktree_dir):
@@ -756,15 +820,16 @@ def _do_remove(root, config, entry, worktree_dir, main_dir):
     """Side-effecting orchestrator for Remove.
 
     Order matters:
-      1. _cleanup_worktree(worktree_dir)         # R060012 (best effort)
+      1. _cleanup_worktree(worktree_dir)         # R060012 / R060017 (best effort)
       2. _git_worktree_remove(main_dir, ...)     # R060013
       3. os.remove(<project file>)               # R060014
       4. drop entry from config and _write_json  # R060015
 
-    Returns the boolean from `_cleanup_worktree` so the caller can message
-    whether cleanup actually ran. Raises GitError or OSError on failure.
+    Returns the ``{"pipenv": bool, "docker": bool}`` dict from
+    `_cleanup_worktree` so the caller can message which cleanups actually ran.
+    Raises GitError or OSError on failure.
     """
-    cleanup_ran = _cleanup_worktree(worktree_dir)
+    cleanup = _cleanup_worktree(worktree_dir)
     _git_worktree_remove(main_dir, worktree_dir)
 
     project_path = os.path.join(root, SUBLIME_PROJECTS_DIRNAME, entry["project_file"])
@@ -778,7 +843,7 @@ def _do_remove(root, config, entry, worktree_dir, main_dir):
         wt for wt in config["worktrees"] if wt["name"] != entry["name"]
     ]
     _write_json(os.path.join(root, CONFIG_FILENAME), config)
-    return cleanup_ran
+    return cleanup
 
 
 def _find_stale_worktrees(root, config):
@@ -1521,7 +1586,7 @@ class SubtreeRemoveCommand(sublime_plugin.WindowCommand):
             return
 
         try:
-            cleanup_ran = _do_remove(root, config, entry, worktree_dir, main_dir)
+            cleanup = _do_remove(root, config, entry, worktree_dir, main_dir)
         except GitError as e:
             sublime.error_message(
                 "Subtree: git worktree remove failed: {} (R060016)".format(e)
@@ -1534,7 +1599,14 @@ class SubtreeRemoveCommand(sublime_plugin.WindowCommand):
             )
             return
 
-        suffix = "" if cleanup_ran else " (pipenv not installed; cleanup skipped)"
+        skipped = [
+            tool for tool in ("pipenv", "docker") if not cleanup[tool]
+        ]
+        suffix = ""
+        if skipped:
+            suffix = " ({} not installed; cleanup skipped)".format(
+                " and ".join(skipped)
+            )
         sublime.status_message(
             "Subtree: removed worktree '{}'{}".format(entry["name"], suffix)
         )
