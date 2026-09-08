@@ -19,6 +19,16 @@ RESERVED_DIRNAMES = (WORKTREES_DIRNAME, SUBLIME_PROJECTS_DIRNAME)
 _INVALID_REPO_NAME_RE = re.compile(r"[\\/]|[\x00-\x1f]")
 _COPY_GLOB_MAGIC = re.compile(r"[*?\[]")
 
+# R030023: filename suffixes eligible for a path rewrite in a new worktree.
+# Edit this tuple to widen or narrow the rewrite; matching is case-sensitive
+# and files without an extension are never rewritten.
+REWRITE_FILE_EXTENSIONS = (".md", ".txt", ".sh", ".bash", ".py")
+
+# A worktree path occurrence is only replaced when the byte that follows it
+# cannot continue a path component, so `.../master` never matches inside
+# `.../master2`, `.../master-old`, or `.../master.bak` (R030023).
+_PATH_CONTINUATION_RE = re.compile(rb"[A-Za-z0-9_.\-]")
+
 
 class GitError(RuntimeError):
     pass
@@ -299,7 +309,8 @@ def _expand_copy_entry(source_dir, rel):
     return expanded
 
 
-def _copy_listed_directories(source_dir, new_dir, entries, progress=None):
+def _copy_listed_directories(source_dir, new_dir, entries, progress=None,
+                             on_copied=None):
     """R030021 / R040021: copy each gitignored entry from `source_dir` to `new_dir`.
 
     Returns a list of human-readable warning strings (empty if every entry was
@@ -315,6 +326,11 @@ def _copy_listed_directories(source_dir, new_dir, entries, progress=None):
     before each entry starts (`done=0`), periodically while files are copied
     (at most ~10 Hz), and once at completion (`done==total`). Symlink files
     are not counted in `total` (see `_count_copyable_files`).
+
+    If `on_copied` is a callable, it is invoked with the relative path of each
+    entry that was copied successfully. Skipped entries never reach it, so the
+    caller can scope a follow-up pass (R030023) to content Subtree itself put
+    in the new worktree.
     """
     warnings = []
     expanded_entries = []
@@ -378,7 +394,143 @@ def _copy_listed_directories(source_dir, new_dir, entries, progress=None):
             warnings.append(
                 "copy_directories: failed to copy {!r}: {}".format(rel, e)
             )
+            continue
+        if on_copied is not None:
+            on_copied(rel)
     return warnings
+
+
+def _has_rewritable_extension(name):
+    """Return True iff `name` ends in one of `REWRITE_FILE_EXTENSIONS` (R030023).
+
+    Matching is case-sensitive, so `NOTES.MD` is not rewritten. A name with no
+    extension never matches, which includes a dotfile named exactly like one of
+    the extensions (`.py` is a whole filename, not a `.py` file).
+    """
+    return any(
+        name.endswith(ext) and len(name) > len(ext)
+        for ext in REWRITE_FILE_EXTENSIONS
+    )
+
+
+def _rewrite_path_bytes(data, old, new):
+    """Return `data` with boundary-terminated occurrences of `old` replaced by `new`.
+
+    Operates on bytes so encodings, line endings, and binary content pass
+    through untouched. An occurrence is replaced only when the byte after it
+    cannot continue a path component (see `_PATH_CONTINUATION_RE`); end of
+    data counts as a boundary. This is stricter than the naive substring swap
+    of R030017 and keeps sibling worktree paths intact (R030023).
+    """
+    if not old or old not in data:
+        return data
+    out = bytearray()
+    i = 0
+    while True:
+        j = data.find(old, i)
+        if j < 0:
+            out += data[i:]
+            return bytes(out)
+        end = j + len(old)
+        if _PATH_CONTINUATION_RE.match(data[end:end + 1]):
+            out += data[i:end]
+        else:
+            out += data[i:j] + new
+        i = end
+
+
+def _git_tracked_files(worktree_dir):
+    """Return the worktree's index entries as relative `/`-separated paths (R030023).
+
+    Wraps `git -C <worktree_dir> ls-files -z`. Raises GitError if git is
+    missing or the invocation fails.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "-C", worktree_dir, "ls-files", "-z"],
+            capture_output=True,
+        )
+    except FileNotFoundError:
+        raise GitError("`git` was not found on PATH.")
+    if result.returncode != 0:
+        stderr = result.stderr.decode("utf-8", "replace").strip()
+        raise GitError(
+            "git ls-files failed: " + (stderr or "exit {}".format(result.returncode))
+        )
+    return [
+        entry.decode("utf-8", "surrogateescape")
+        for entry in result.stdout.split(b"\0")
+        if entry
+    ]
+
+
+def _walk_relative_files(new_dir, rel_dir):
+    """Yield `/`-separated paths of every file under `<new_dir>/<rel_dir>`.
+
+    Supplies the copied-directory half of the R030023 candidate set. Symlinked
+    subdirectories are not followed; symlinked files are filtered by the caller.
+    """
+    base = os.path.join(new_dir, *rel_dir.split("/"))
+    for dirpath, _dirnames, filenames in os.walk(base, followlinks=False):
+        for name in filenames:
+            full = os.path.join(dirpath, name)
+            yield os.path.relpath(full, new_dir).replace(os.sep, "/")
+
+
+def _rewrite_worktree_paths(new_dir, source_dir, copied_dirs=()):
+    """R030023: swap `source_dir` for `new_dir` inside the new worktree's files.
+
+    Candidates are the new worktree's tracked files plus every file under each
+    directory in `copied_dirs` (relative paths of entries copied per R030021).
+    A candidate is a rewritable file only if it is a regular non-symlink file
+    whose name satisfies `_has_rewritable_extension`; the substitution follows
+    `_rewrite_path_bytes`, and a file is written back only when it changed.
+
+    Returns `(count, warnings)`. Never raises: a failure to enumerate tracked
+    files or to read/write one file yields a warning and the pass continues,
+    mirroring the warning contract of `_copy_listed_directories`
+    (R030022 / R040022). Rewritten tracked files show up as modified in
+    `git status`, which is expected.
+    """
+    warnings = []
+    candidates = []
+    try:
+        candidates.extend(_git_tracked_files(new_dir))
+    except GitError as e:
+        warnings.append("path rewrite: could not list tracked files: {}".format(e))
+    for rel_dir in copied_dirs:
+        candidates.extend(_walk_relative_files(new_dir, rel_dir))
+
+    old_bytes = source_dir.encode("utf-8", "surrogateescape")
+    new_bytes = new_dir.encode("utf-8", "surrogateescape")
+    count = 0
+    seen = set()
+    for rel in candidates:
+        if rel in seen:
+            continue
+        seen.add(rel)
+        if not _has_rewritable_extension(rel.rsplit("/", 1)[-1]):
+            continue
+        path = os.path.join(new_dir, *rel.split("/"))
+        if os.path.islink(path) or not os.path.isfile(path):
+            continue
+        try:
+            with open(path, "rb") as f:
+                data = f.read()
+        except OSError as e:
+            warnings.append("path rewrite: could not read {!r}: {}".format(rel, e))
+            continue
+        rewritten = _rewrite_path_bytes(data, old_bytes, new_bytes)
+        if rewritten == data:
+            continue
+        try:
+            with open(path, "wb") as f:
+                f.write(rewritten)
+        except OSError as e:
+            warnings.append("path rewrite: could not write {!r}: {}".format(rel, e))
+            continue
+        count += 1
+    return count, warnings
 
 
 def _local_branch_exists(repo_cwd, branch):
@@ -481,21 +633,29 @@ def _resolve_base_branch(source_dir, branch):
     return current, None
 
 
-def _do_create(source_dir, source_name, source_template,
+def _do_create(git_cwd, source_name, source_template,
                new_worktree_dir, new_project_path,
                branch, base_branch, project_filename, root, config,
-               copy_directories=(), copy_progress=None):
+               copy_directories=(), copy_progress=None, on_rewritten=None):
     """Side-effecting orchestration. Order matters:
 
     1. `git worktree add` (R030014 / R030015) — failure leaves Subtree state untouched.
     2. Write new sublime-project file (R030017).
     3. Append config entry and rewrite subtree_config.json (R030018).
-    4. Copy gitignored directories from source (R030021 / R040021).
+    4. Copy gitignored directories from the source worktree (R030021 / R040021).
+    5. Rewrite the source worktree path inside the new worktree (R030023 / R040023).
+
+    `git_cwd` is only the working directory for git: `open` passes the main
+    worktree because that is where its base ref resolves (R040015 / R040016).
+    Steps 2, 4, and 5 all key off `<root>/worktrees/<source_name>`, which is
+    the source worktree for `create` and the template-source worktree for
+    `open`.
 
     Raises GitError on git failure (no Subtree files written), OSError on a
     later write failure (worktree dir already exists on disk). Returns a list
-    of warnings from step 4 — non-empty lists do not roll back steps 1-3
-    (R030022 / R040022).
+    of warnings from steps 4-5 — non-empty lists do not roll back steps 1-3
+    (R030022 / R040022). `on_rewritten`, if given, receives the number of
+    files step 5 changed.
     """
     # R010002: branches with '/' produce nested paths under worktrees/. Ensure
     # the parent directory exists before invoking git (git already does this,
@@ -503,12 +663,11 @@ def _do_create(source_dir, source_name, source_template,
     parent = os.path.dirname(new_worktree_dir)
     if parent:
         os.makedirs(parent, exist_ok=True)
-    _git_worktree_add(source_dir, new_worktree_dir, branch, base_branch)
+    _git_worktree_add(git_cwd, new_worktree_dir, branch, base_branch)
 
+    template_worktree_dir = os.path.join(root, WORKTREES_DIRNAME, source_name)
     new_project = _rewrite_template(
-        source_template,
-        os.path.join(root, WORKTREES_DIRNAME, source_name),
-        new_worktree_dir,
+        source_template, template_worktree_dir, new_worktree_dir,
     )
     _write_json(new_project_path, new_project)
 
@@ -519,9 +678,18 @@ def _do_create(source_dir, source_name, source_template,
     })
     _write_json(os.path.join(root, CONFIG_FILENAME), config)
 
-    return _copy_listed_directories(
-        source_dir, new_worktree_dir, copy_directories, progress=copy_progress,
+    copied = []
+    warnings = _copy_listed_directories(
+        template_worktree_dir, new_worktree_dir, copy_directories,
+        progress=copy_progress, on_copied=copied.append,
     )
+
+    count, rewrite_warnings = _rewrite_worktree_paths(
+        new_worktree_dir, template_worktree_dir, copied_dirs=copied,
+    )
+    if on_rewritten is not None:
+        on_rewritten(count)
+    return warnings + rewrite_warnings
 
 
 def _find_main_worktree(root, config):
@@ -1001,6 +1169,21 @@ def _status_progress_callback(op_label):
     return _cb
 
 
+def _status_rewrite_callback(op_label):
+    """Return an `on_rewritten(count)` callback that reports the R030023 rewrite
+    on the status bar. Silent when nothing was rewritten, which is the common
+    case for repositories that hold no absolute paths.
+    """
+    def _cb(count):
+        if count > 0:
+            sublime.status_message(
+                "Subtree ({}): rewrote worktree path in {} file(s)".format(
+                    op_label, count,
+                )
+            )
+    return _cb
+
+
 def _open_project_and_close(window, project_path, op_label, close_window=True):
     """Open `project_path` via `subl --project`.
 
@@ -1216,6 +1399,7 @@ class SubtreeCreateCommand(sublime_plugin.WindowCommand):
                 branch, base_branch, project_filename, root, config,
                 copy_directories=_get_copy_directories(config),
                 copy_progress=_status_progress_callback("Create"),
+                on_rewritten=_status_rewrite_callback("Create"),
             )
         except GitError as e:
             sublime.error_message(
@@ -1375,14 +1559,17 @@ class SubtreeOpenCommand(sublime_plugin.WindowCommand):
         # R040015 / R040016: base ref is None for local, the remote ref for remote-only.
         base_branch = None if candidate["remote"] is None else candidate["ref"]
 
-        # R040021: directories are copied from the template-source worktree, not main.
-        template_dir = os.path.join(root, WORKTREES_DIRNAME, template_name)
-
         try:
+            # R040021 / R040023: `_do_create` keys copying and the path rewrite off
+            # `template_name`, so both use the template-source worktree even though
+            # git runs in `main_dir` (R040015 / R040016).
             warnings = _do_create(
                 main_dir, template_name, source_template,
                 new_worktree_dir, new_project_path,
                 branch, base_branch, project_filename, root, config,
+                copy_directories=_get_copy_directories(config),
+                copy_progress=_status_progress_callback("Open"),
+                on_rewritten=_status_rewrite_callback("Open"),
             )
         except GitError as e:
             sublime.error_message(
@@ -1395,14 +1582,6 @@ class SubtreeOpenCommand(sublime_plugin.WindowCommand):
                 "Inspect {} manually.".format(e, root)
             )
             return
-
-        # R040021: invoked here (rather than via `_do_create`'s copy hook) because the
-        # copy source is the template-source worktree, while `_do_create`'s `source_dir`
-        # is the main worktree (the git base, per R040015 / R040016).
-        warnings = warnings + _copy_listed_directories(
-            template_dir, new_worktree_dir, _get_copy_directories(config),
-            progress=_status_progress_callback("Open"),
-        )
 
         if warnings:
             sublime.message_dialog(

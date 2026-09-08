@@ -71,4 +71,6 @@ At copy time (see [R030021](../requirements.md#3-create-operation) / [R040021](.
 - Entries that already exist at the target path are skipped with a warning (defensive — gitignored entries should not exist there after `git worktree add`).
 - Otherwise the directory is copied recursively, preserving symlinks.
 
+After copying finishes, Subtree rewrites the source worktree's absolute path inside the new worktree's files — both git-tracked files and files under the directories copied here (see [R030023](../requirements.md#3-create-operation) / [R040023](../requirements.md#4-open-operation)). Which files qualify is governed by `REWRITE_FILE_EXTENSIONS` in `subtree.py`, not by this config: the rewrite has no `settings` key.
+
 Intended for local-only artefacts such as Python virtualenvs (`.venv`), IDE caches (`.idea`), or build caches that are slow to rebuild from scratch. [`init`](../requirements.md#2-init-operation) does not write `settings` — it is up to the user to add it after initialising the repository.

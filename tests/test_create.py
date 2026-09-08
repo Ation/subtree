@@ -1103,5 +1103,427 @@ class TestDoCreateCopiesDirectories(unittest.TestCase):
             self.assertFalse(os.path.exists(os.path.join(new_worktree_dir, "cache_dir")))
 
 
+class TestHasRewritableExtension(unittest.TestCase):
+    """R030023 — name matches one of REWRITE_FILE_EXTENSIONS, case-sensitively."""
+
+    def test_accepts_every_listed_extension(self):
+        for ext in subtree.REWRITE_FILE_EXTENSIONS:
+            self.assertTrue(subtree._has_rewritable_extension("thing" + ext), ext)
+
+    def test_rejects_uppercase_extension(self):
+        self.assertFalse(subtree._has_rewritable_extension("NOTES.MD"))
+        self.assertFalse(subtree._has_rewritable_extension("Setup.PY"))
+
+    def test_rejects_extensionless_name(self):
+        self.assertFalse(subtree._has_rewritable_extension("activate"))
+        self.assertFalse(subtree._has_rewritable_extension("Makefile"))
+
+    def test_rejects_unlisted_extension(self):
+        self.assertFalse(subtree._has_rewritable_extension("config.json"))
+        self.assertFalse(subtree._has_rewritable_extension("lib.so"))
+
+    def test_rejects_dotfile_named_exactly_like_an_extension(self):
+        for ext in subtree.REWRITE_FILE_EXTENSIONS:
+            self.assertFalse(subtree._has_rewritable_extension(ext), ext)
+
+
+class TestRewritePathBytes(unittest.TestCase):
+    """R030023 — boundary-aware byte-level substitution."""
+
+    OLD = b"/repo/worktrees/master"
+    NEW = b"/repo/worktrees/feature_1"
+
+    def _rw(self, data):
+        return subtree._rewrite_path_bytes(data, self.OLD, self.NEW)
+
+    def test_replaces_when_followed_by_separator(self):
+        self.assertEqual(
+            self._rw(b"cd /repo/worktrees/master/src\n"),
+            b"cd /repo/worktrees/feature_1/src\n",
+        )
+
+    def test_replaces_at_end_of_data(self):
+        self.assertEqual(self._rw(b"cd /repo/worktrees/master"), b"cd /repo/worktrees/feature_1")
+
+    def test_replaces_when_followed_by_boundary_punctuation(self):
+        for nxt in (b'"', b"'", b" ", b"\n", b":", b";", b")", b","):
+            self.assertEqual(
+                self._rw(b"p=" + self.OLD + nxt),
+                b"p=" + self.NEW + nxt,
+                nxt,
+            )
+
+    def test_leaves_sibling_worktree_paths_alone(self):
+        for nxt in (b"2", b"-old", b"_v2", b".bak", b"x"):
+            data = b"p=" + self.OLD + nxt
+            self.assertEqual(self._rw(data), data, nxt)
+
+    def test_replaces_every_occurrence(self):
+        data = self.OLD + b"/a\n" + self.OLD + b"/b\n"
+        self.assertEqual(self._rw(data), self.NEW + b"/a\n" + self.NEW + b"/b\n")
+
+    def test_mixes_replaced_and_skipped_occurrences(self):
+        data = self.OLD + b"2/a\n" + self.OLD + b"/b\n"
+        self.assertEqual(self._rw(data), self.OLD + b"2/a\n" + self.NEW + b"/b\n")
+
+    def test_returns_input_unchanged_when_absent(self):
+        data = b"nothing to see here"
+        self.assertEqual(self._rw(data), data)
+
+    def test_preserves_crlf_and_non_utf8_bytes(self):
+        data = b"\xff\xfe binary\r\n" + self.OLD + b"/x\r\n\x00tail"
+        self.assertEqual(
+            self._rw(data),
+            b"\xff\xfe binary\r\n" + self.NEW + b"/x\r\n\x00tail",
+        )
+
+
+class TestGitTrackedFiles(unittest.TestCase):
+    """R030023 — enumeration of the new worktree's index via `git ls-files -z`."""
+
+    def test_lists_committed_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _init_git_repo(tmp)
+            os.makedirs(os.path.join(tmp, "pkg"))
+            with open(os.path.join(tmp, "pkg", "mod.py"), "w") as f:
+                f.write("x")
+            subprocess.run(["git", "-C", tmp, "add", "pkg/mod.py"],
+                           check=True, capture_output=True)
+            subprocess.run(["git", "-C", tmp, "commit", "-q", "-m", "add"],
+                           check=True, capture_output=True)
+            self.assertEqual(
+                sorted(subtree._git_tracked_files(tmp)), ["README.md", "pkg/mod.py"]
+            )
+
+    def test_excludes_untracked_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _init_git_repo(tmp)
+            with open(os.path.join(tmp, "loose.py"), "w") as f:
+                f.write("x")
+            self.assertNotIn("loose.py", subtree._git_tracked_files(tmp))
+
+    def test_raises_git_error_outside_repository(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(subtree.GitError):
+                subtree._git_tracked_files(tmp)
+
+
+class TestRewriteWorktreePaths(unittest.TestCase):
+    """R030023 — the rewrite pass over a new worktree."""
+
+    def _worktree(self, tmp):
+        """Return (source_dir, new_dir); new_dir is a git repo with one commit."""
+        source_dir = os.path.join(tmp, "worktrees", "master")
+        new_dir = os.path.join(tmp, "worktrees", "feature_1")
+        os.makedirs(source_dir)
+        _init_git_repo(new_dir)
+        return source_dir, new_dir
+
+    def _commit(self, repo, relpath, data):
+        full = os.path.join(repo, *relpath.split("/"))
+        os.makedirs(os.path.dirname(full), exist_ok=True)
+        with open(full, "wb") as f:
+            f.write(data)
+        subprocess.run(["git", "-C", repo, "add", "--", relpath],
+                       check=True, capture_output=True)
+        subprocess.run(["git", "-C", repo, "commit", "-q", "-m", "add " + relpath],
+                       check=True, capture_output=True)
+        return full
+
+    def test_rewrites_tracked_python_and_markdown(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source_dir, new_dir = self._worktree(tmp)
+            py = self._commit(new_dir, "run.py",
+                              ('P = "%s/data"\n' % source_dir).encode())
+            md = self._commit(new_dir, "docs/guide.md",
+                              ("See %s/docs\n" % source_dir).encode())
+
+            count, warnings = subtree._rewrite_worktree_paths(new_dir, source_dir)
+
+            self.assertEqual(warnings, [])
+            self.assertEqual(count, 2)
+            with open(py) as f:
+                self.assertEqual(f.read(), 'P = "%s/data"\n' % new_dir)
+            with open(md) as f:
+                self.assertEqual(f.read(), "See %s/docs\n" % new_dir)
+
+    def test_rewritten_tracked_files_show_as_modified(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source_dir, new_dir = self._worktree(tmp)
+            self._commit(new_dir, "run.py", ("%s/data\n" % source_dir).encode())
+
+            subtree._rewrite_worktree_paths(new_dir, source_dir)
+
+            status = subprocess.run(
+                ["git", "-C", new_dir, "status", "--porcelain"],
+                capture_output=True, text=True, check=True,
+            ).stdout
+            self.assertIn("run.py", status)
+            self.assertTrue(status.strip().startswith("M"), status)
+
+    def test_rewrites_file_inside_copied_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source_dir, new_dir = self._worktree(tmp)
+            venv = os.path.join(new_dir, ".venv", "bin")
+            os.makedirs(venv)
+            script = os.path.join(venv, "helper.sh")
+            with open(script, "w") as f:
+                f.write("exec %s/bin/tool\n" % source_dir)
+
+            count, warnings = subtree._rewrite_worktree_paths(
+                new_dir, source_dir, copied_dirs=[".venv"]
+            )
+
+            self.assertEqual(warnings, [])
+            self.assertEqual(count, 1)
+            with open(script) as f:
+                self.assertEqual(f.read(), "exec %s/bin/tool\n" % new_dir)
+
+    def test_ignores_untracked_file_outside_copied_directories(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source_dir, new_dir = self._worktree(tmp)
+            loose = os.path.join(new_dir, "loose.py")
+            with open(loose, "w") as f:
+                f.write("%s/x\n" % source_dir)
+
+            count, warnings = subtree._rewrite_worktree_paths(new_dir, source_dir)
+
+            self.assertEqual((count, warnings), (0, []))
+            with open(loose) as f:
+                self.assertEqual(f.read(), "%s/x\n" % source_dir)
+
+    def test_leaves_sibling_worktree_path_alone(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source_dir, new_dir = self._worktree(tmp)
+            body = "a=%s2/x\nb=%s/x\n" % (source_dir, source_dir)
+            f_path = self._commit(new_dir, "paths.txt", body.encode())
+
+            count, _ = subtree._rewrite_worktree_paths(new_dir, source_dir)
+
+            self.assertEqual(count, 1)
+            with open(f_path) as f:
+                self.assertEqual(f.read(), "a=%s2/x\nb=%s/x\n" % (source_dir, new_dir))
+
+    def test_skips_uppercase_extension_and_extensionless_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source_dir, new_dir = self._worktree(tmp)
+            body = ("%s/x\n" % source_dir).encode()
+            upper = self._commit(new_dir, "NOTES.MD", body)
+            plain = self._commit(new_dir, "activate", body)
+
+            count, warnings = subtree._rewrite_worktree_paths(new_dir, source_dir)
+
+            self.assertEqual((count, warnings), (0, []))
+            for path in (upper, plain):
+                with open(path, "rb") as f:
+                    self.assertEqual(f.read(), body)
+
+    def test_skips_symlinked_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source_dir, new_dir = self._worktree(tmp)
+            os.makedirs(os.path.join(new_dir, ".venv"))
+            target = os.path.join(tmp, "outside.py")
+            with open(target, "w") as f:
+                f.write("%s/x\n" % source_dir)
+            link = os.path.join(new_dir, ".venv", "linked.py")
+            os.symlink(target, link)
+
+            count, warnings = subtree._rewrite_worktree_paths(
+                new_dir, source_dir, copied_dirs=[".venv"]
+            )
+
+            self.assertEqual((count, warnings), (0, []))
+            self.assertTrue(os.path.islink(link))
+            with open(target) as f:
+                self.assertEqual(f.read(), "%s/x\n" % source_dir)
+
+    def test_preserves_crlf_and_binary_bytes_in_rewritten_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source_dir, new_dir = self._worktree(tmp)
+            body = b"\xff\xfe\r\n" + source_dir.encode() + b"/x\r\n\x00"
+            path = self._commit(new_dir, "data.txt", body)
+
+            count, warnings = subtree._rewrite_worktree_paths(new_dir, source_dir)
+
+            self.assertEqual((count, warnings), (1, []))
+            with open(path, "rb") as f:
+                self.assertEqual(
+                    f.read(), b"\xff\xfe\r\n" + new_dir.encode() + b"/x\r\n\x00"
+                )
+
+    def test_preserves_executable_bit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source_dir, new_dir = self._worktree(tmp)
+            path = self._commit(new_dir, "tool.sh", ("%s/x\n" % source_dir).encode())
+            os.chmod(path, 0o755)
+
+            subtree._rewrite_worktree_paths(new_dir, source_dir)
+
+            self.assertTrue(os.stat(path).st_mode & 0o111)
+
+    def test_counts_each_file_once_when_tracked_and_in_copied_dir(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source_dir, new_dir = self._worktree(tmp)
+            self._commit(new_dir, "tools/x.py", ("%s/a\n" % source_dir).encode())
+
+            count, warnings = subtree._rewrite_worktree_paths(
+                new_dir, source_dir, copied_dirs=["tools"]
+            )
+
+            self.assertEqual((count, warnings), (1, []))
+
+    def test_warns_once_and_continues_when_ls_files_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source_dir = os.path.join(tmp, "worktrees", "master")
+            new_dir = os.path.join(tmp, "worktrees", "feature_1")
+            os.makedirs(source_dir)
+            os.makedirs(os.path.join(new_dir, ".venv"))
+            script = os.path.join(new_dir, ".venv", "run.sh")
+            with open(script, "w") as f:
+                f.write("%s/x\n" % source_dir)
+
+            count, warnings = subtree._rewrite_worktree_paths(
+                new_dir, source_dir, copied_dirs=[".venv"]
+            )
+
+            self.assertEqual(len(warnings), 1)
+            self.assertIn("tracked files", warnings[0])
+            self.assertEqual(count, 1)
+            with open(script) as f:
+                self.assertEqual(f.read(), "%s/x\n" % new_dir)
+
+    def test_warns_and_names_unreadable_file(self):
+        if os.geteuid() == 0:
+            self.skipTest("root bypasses file permissions")
+        with tempfile.TemporaryDirectory() as tmp:
+            source_dir, new_dir = self._worktree(tmp)
+            path = self._commit(new_dir, "locked.py", ("%s/x\n" % source_dir).encode())
+            os.chmod(path, 0o000)
+            try:
+                count, warnings = subtree._rewrite_worktree_paths(new_dir, source_dir)
+            finally:
+                os.chmod(path, 0o644)
+
+            self.assertEqual(count, 0)
+            self.assertEqual(len(warnings), 1)
+            self.assertIn("locked.py", warnings[0])
+
+    def test_missing_copied_dir_is_silently_ignored(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source_dir, new_dir = self._worktree(tmp)
+            count, warnings = subtree._rewrite_worktree_paths(
+                new_dir, source_dir, copied_dirs=["nope"]
+            )
+            self.assertEqual((count, warnings), (0, []))
+
+
+class TestDoCreateRewritesPaths(unittest.TestCase):
+    """R030023 — full create rewrites the new worktree's files."""
+
+    def _prepare(self, tmp, copy_directories=None):
+        root, config = _make_subtree_repo(tmp)
+        if copy_directories is not None:
+            config["settings"] = {"copy_directories": copy_directories}
+            with open(os.path.join(root, subtree.CONFIG_FILENAME), "w") as f:
+                json.dump(config, f, indent=4)
+                f.write("\n")
+        return root, config
+
+    def _create(self, root, config, branch="feature_1", copy_directories=(),
+                on_rewritten=None):
+        source_dir = os.path.join(root, "worktrees", "master")
+        repo_name = config["meta_information"]["repository_name"]
+        project_filename = "{}_{}.sublime-project".format(repo_name, branch)
+        new_worktree_dir = os.path.join(root, "worktrees", branch)
+        new_project_path = os.path.join(root, "sublime_projects", project_filename)
+        source_template = subtree._load_source_template(os.path.join(
+            root, "sublime_projects", "my_app_master.sublime-project"
+        ))
+        base_branch, _ = subtree._resolve_base_branch(source_dir, branch)
+        warnings = subtree._do_create(
+            source_dir, "master", source_template,
+            new_worktree_dir, new_project_path,
+            branch, base_branch, project_filename, root, config,
+            copy_directories=copy_directories,
+            on_rewritten=on_rewritten,
+        )
+        return new_worktree_dir, warnings
+
+    def test_rewrites_tracked_script_and_doc(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, config = self._prepare(tmp)
+            source_dir = os.path.join(root, "worktrees", "master")
+            with open(os.path.join(source_dir, "run.py"), "w") as f:
+                f.write('ROOT = "%s"\n' % source_dir)
+            with open(os.path.join(source_dir, "GUIDE.md"), "w") as f:
+                f.write("cd %s\n" % source_dir)
+            subprocess.run(["git", "-C", source_dir, "add", "run.py", "GUIDE.md"],
+                           check=True, capture_output=True)
+            subprocess.run(["git", "-C", source_dir, "commit", "-q", "-m", "scripts"],
+                           check=True, capture_output=True)
+
+            new_dir, warnings = self._create(root, config)
+
+            self.assertEqual(warnings, [])
+            with open(os.path.join(new_dir, "run.py")) as f:
+                self.assertEqual(f.read(), 'ROOT = "%s"\n' % new_dir)
+            with open(os.path.join(new_dir, "GUIDE.md")) as f:
+                self.assertEqual(f.read(), "cd %s\n" % new_dir)
+
+    def test_reports_rewritten_count(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, config = self._prepare(tmp)
+            source_dir = os.path.join(root, "worktrees", "master")
+            with open(os.path.join(source_dir, "run.py"), "w") as f:
+                f.write("%s\n" % source_dir)
+            subprocess.run(["git", "-C", source_dir, "add", "run.py"],
+                           check=True, capture_output=True)
+            subprocess.run(["git", "-C", source_dir, "commit", "-q", "-m", "s"],
+                           check=True, capture_output=True)
+            seen = []
+
+            self._create(root, config, on_rewritten=seen.append)
+
+            self.assertEqual(seen, [1])
+
+    def test_rewrites_file_inside_copied_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, config = self._prepare(tmp, copy_directories=[".venv"])
+            source_dir = os.path.join(root, "worktrees", "master")
+            with open(os.path.join(source_dir, ".gitignore"), "w") as f:
+                f.write(".venv/\n")
+            subprocess.run(["git", "-C", source_dir, "add", ".gitignore"],
+                           check=True, capture_output=True)
+            subprocess.run(["git", "-C", source_dir, "commit", "-q", "-m", "ignore"],
+                           check=True, capture_output=True)
+            os.makedirs(os.path.join(source_dir, ".venv", "bin"))
+            with open(os.path.join(source_dir, ".venv", "bin", "go.sh"), "w") as f:
+                f.write("exec %s/bin/python\n" % source_dir)
+
+            new_dir, warnings = self._create(
+                root, config, copy_directories=[".venv"]
+            )
+
+            self.assertEqual(warnings, [])
+            with open(os.path.join(new_dir, ".venv", "bin", "go.sh")) as f:
+                self.assertEqual(f.read(), "exec %s/bin/python\n" % new_dir)
+
+    def test_does_not_rewrite_skipped_copy_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, config = self._prepare(tmp, copy_directories=["cache_dir"])
+            source_dir = os.path.join(root, "worktrees", "master")
+            os.makedirs(os.path.join(source_dir, "cache_dir"))
+            with open(os.path.join(source_dir, "cache_dir", "x.sh"), "w") as f:
+                f.write("%s\n" % source_dir)
+
+            new_dir, warnings = self._create(
+                root, config, copy_directories=["cache_dir"]
+            )
+
+            self.assertEqual(len(warnings), 1)
+            self.assertIn("not gitignored", warnings[0])
+            self.assertFalse(os.path.exists(os.path.join(new_dir, "cache_dir")))
+
+
 if __name__ == "__main__":
     unittest.main()

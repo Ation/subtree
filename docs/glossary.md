@@ -55,6 +55,19 @@ A `.sublime-project` or `.sublime-workspace` file in [`sublime_projects/`](struc
 
 An entry in `worktrees[]` of [`subtree_config.json`](schemas/subtree_config.md) whose [worktree directory](#worktree-directory) no longer exists on disk — a dangling reference left behind when a worktree is deleted outside Subtree. [`prune`](requirements.md#8-prune-operation) removes stale entries and their leftover project/workspace files. The [main worktree](#main-worktree) is never treated as stale ([R010001](requirements.md#1-restrictions-and-general-requirements)).
 
+### Path rewrite
+
+Replacement, inside a file's contents, of the [source worktree](#source-worktree)'s absolute directory path with the new worktree's absolute directory path. Only the source worktree's own path is ever replaced; paths of other worktrees are left as they are.
+
+[`create`](requirements.md#3-create-operation) and [`open`](requirements.md#4-open-operation) perform two path rewrites that differ in how a match is recognised:
+
+- On the new sublime-project file ([R030017](requirements.md#3-create-operation) / [R040017](requirements.md#4-open-operation)) the match is a **naive substring swap**, so a sibling path such as `worktrees/master_old` is also rewritten when the source worktree is `master` (see the [sublime project schema](schemas/sublime_project.md)).
+- On every [rewritable file](#rewritable-file) in the new worktree ([R030023](requirements.md#3-create-operation) / [R040023](requirements.md#4-open-operation)) the match is **boundary-aware**, so sibling paths are left intact.
+
+### Rewritable file
+
+A regular (non-symlink) file in a newly created [worktree directory](#worktree-directory) that is subject to the [path rewrite](#path-rewrite) of [R030023](requirements.md#3-create-operation): it is either tracked in the worktree's git index or lies inside a directory copied per `settings.copy_directories`, and its name ends in one of the extensions listed in Subtree's source code. Files without an extension are never rewritable.
+
 ### Subtree config file
 
 [`subtree_config.json`](schemas/subtree_config.md) at the root directory; the source of truth for Subtree's view of the repository.

@@ -364,6 +364,33 @@ class TestDoOpenViaDoCreate(unittest.TestCase):
             self.assertEqual(entry["project_file"], "my_app_feature__foo.sublime-project")
 
 
+def _make_template_worktree(root, main_dir, template_name):
+    """Materialise a non-main worktree via `_do_create`, for use as the
+    open-template source. Returns the new worktree directory.
+    """
+    subprocess.run(
+        ["git", "-C", main_dir, "branch", template_name],
+        check=True, capture_output=True,
+    )
+    with open(os.path.join(root, subtree.CONFIG_FILENAME)) as f:
+        config = json.load(f)
+    repo_name = config["meta_information"]["repository_name"]
+    new_wt = os.path.join(root, subtree.WORKTREES_DIRNAME, template_name)
+    project_filename = subtree._branch_to_project_filename(repo_name, template_name)
+    new_project_path = os.path.join(
+        root, subtree.SUBLIME_PROJECTS_DIRNAME, project_filename
+    )
+    source_template = subtree._load_source_template(os.path.join(
+        root, subtree.SUBLIME_PROJECTS_DIRNAME, "my_app_master.sublime-project"
+    ))
+    subtree._do_create(
+        main_dir, "master", source_template,
+        new_wt, new_project_path,
+        template_name, None, project_filename, root, config,
+    )
+    return new_wt
+
+
 class TestOpenCopiesDirectoriesFromTemplate(unittest.TestCase):
     """R040021 — open copies directories from the template-source worktree.
 
@@ -384,39 +411,13 @@ class TestOpenCopiesDirectoriesFromTemplate(unittest.TestCase):
         with open(path) as f:
             return json.load(f)
 
-    def _make_template_worktree(self, root, main_dir, template_name):
-        """Use `_do_create` to materialise a non-main worktree that will serve
-        as the open-template source. Returns the new worktree directory.
-        """
-        subprocess.run(
-            ["git", "-C", main_dir, "branch", template_name],
-            check=True, capture_output=True,
-        )
-        with open(os.path.join(root, subtree.CONFIG_FILENAME)) as f:
-            config = json.load(f)
-        repo_name = config["meta_information"]["repository_name"]
-        new_wt = os.path.join(root, subtree.WORKTREES_DIRNAME, template_name)
-        project_filename = subtree._branch_to_project_filename(repo_name, template_name)
-        new_project_path = os.path.join(
-            root, subtree.SUBLIME_PROJECTS_DIRNAME, project_filename
-        )
-        source_template = subtree._load_source_template(os.path.join(
-            root, subtree.SUBLIME_PROJECTS_DIRNAME, "my_app_master.sublime-project"
-        ))
-        subtree._do_create(
-            main_dir, "master", source_template,
-            new_wt, new_project_path,
-            template_name, None, project_filename, root, config,
-        )
-        return new_wt
-
     def test_open_copies_from_template_worktree(self):
         with tempfile.TemporaryDirectory() as tmp:
             root, _, main_dir = _make_subtree_repo(tmp)
 
             # Bring a non-main template worktree online and add a gitignored
             # .venv to it only (the main worktree gets none).
-            template_dir = self._make_template_worktree(root, main_dir, "template_wt")
+            template_dir = _make_template_worktree(root, main_dir, "template_wt")
             with open(os.path.join(template_dir, ".gitignore"), "w") as f:
                 f.write(".venv/\n")
             subprocess.run(
@@ -450,18 +451,66 @@ class TestOpenCopiesDirectoriesFromTemplate(unittest.TestCase):
                 root, subtree.SUBLIME_PROJECTS_DIRNAME,
                 "my_app_template_wt.sublime-project",
             ))
-            subtree._do_create(
+            warnings = subtree._do_create(
                 main_dir, "template_wt", source_template,
                 new_wt, new_project_path,
                 "to_open", None, project_filename, root, config,
-            )
-            warnings = subtree._copy_listed_directories(
-                template_dir, new_wt, subtree._get_copy_directories(config),
+                copy_directories=subtree._get_copy_directories(config),
             )
 
             self.assertEqual(warnings, [])
             with open(os.path.join(new_wt, ".venv", "marker.txt")) as f:
                 self.assertEqual(f.read(), "from-template")
+
+
+class TestOpenRewritesTemplateWorktreePath(unittest.TestCase):
+    """R040023 — open rewrites the template-source path, not the main one.
+
+    Mirrors R030023, but `open` runs git in the main worktree while the path
+    that must be swapped belongs to the template-source worktree picked in
+    R040013. A tracked file carrying both paths tells the two apart.
+    """
+
+    def test_rewrites_template_path_and_leaves_main_path_alone(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, _, main_dir = _make_subtree_repo(tmp)
+            template_dir = _make_template_worktree(root, main_dir, "template_wt")
+
+            body = "main=%s/x\ntpl=%s/x\n" % (main_dir, template_dir)
+            with open(os.path.join(main_dir, "paths.txt"), "w") as f:
+                f.write(body)
+            subprocess.run(["git", "-C", main_dir, "add", "paths.txt"],
+                           check=True, capture_output=True)
+            subprocess.run(["git", "-C", main_dir, "commit", "-q", "-m", "paths"],
+                           check=True, capture_output=True)
+            subprocess.run(["git", "-C", main_dir, "branch", "to_open"],
+                           check=True, capture_output=True)
+
+            with open(os.path.join(root, subtree.CONFIG_FILENAME)) as f:
+                config = json.load(f)
+            repo_name = config["meta_information"]["repository_name"]
+            new_wt = os.path.join(root, subtree.WORKTREES_DIRNAME, "to_open")
+            project_filename = subtree._branch_to_project_filename(repo_name, "to_open")
+            new_project_path = os.path.join(
+                root, subtree.SUBLIME_PROJECTS_DIRNAME, project_filename
+            )
+            source_template = subtree._load_source_template(os.path.join(
+                root, subtree.SUBLIME_PROJECTS_DIRNAME,
+                "my_app_template_wt.sublime-project",
+            ))
+            counts = []
+
+            warnings = subtree._do_create(
+                main_dir, "template_wt", source_template,
+                new_wt, new_project_path,
+                "to_open", None, project_filename, root, config,
+                on_rewritten=counts.append,
+            )
+
+            self.assertEqual(warnings, [])
+            self.assertEqual(counts, [1])
+            with open(os.path.join(new_wt, "paths.txt")) as f:
+                self.assertEqual(f.read(), "main=%s/x\ntpl=%s/x\n" % (main_dir, new_wt))
 
 
 if __name__ == "__main__":
