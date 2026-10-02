@@ -71,6 +71,44 @@ def _add_worktree(root, config, main_dir, branch_name):
     return new_worktree_dir, new_project_path
 
 
+class TestCheckScratchDir(unittest.TestCase):
+    """R060018 — non-empty `.scratch` in the worktree root blocks removal."""
+
+    def test_missing_scratch_returns_none(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertIsNone(subtree._check_scratch_dir(tmp))
+
+    def test_empty_scratch_returns_none(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            os.mkdir(os.path.join(tmp, ".scratch"))
+            self.assertIsNone(subtree._check_scratch_dir(tmp))
+
+    def test_scratch_file_not_dir_returns_none(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, ".scratch"), "w") as f:
+                f.write("x")
+            self.assertIsNone(subtree._check_scratch_dir(tmp))
+
+    def test_scratch_with_file_blocks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            os.mkdir(os.path.join(tmp, ".scratch"))
+            with open(os.path.join(tmp, ".scratch", "notes.md"), "w") as f:
+                f.write("x")
+            self.assertIn(".scratch", subtree._check_scratch_dir(tmp))
+
+    def test_scratch_with_hidden_entry_blocks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, ".scratch", ".hidden"))
+            self.assertIsNotNone(subtree._check_scratch_dir(tmp))
+
+    def test_nested_scratch_does_not_block(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "sub", ".scratch"))
+            with open(os.path.join(tmp, "sub", ".scratch", "x"), "w") as f:
+                f.write("x")
+            self.assertIsNone(subtree._check_scratch_dir(tmp))
+
+
 class TestCheckUncommittedChanges(unittest.TestCase):
     """R060008 — `git status --porcelain` non-empty -> error."""
 
@@ -537,6 +575,25 @@ class TestConfirmSafeRemoval(unittest.TestCase):
             ok, reason = subtree._confirm_safe_removal(tmp, "master")
             self.assertFalse(ok)
             self.assertIn("uncommitted", reason.lower())
+            self.assertEqual(captured, [])
+
+    def test_gitignored_nonempty_scratch_blocks_without_prompt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _init_git_repo(tmp)
+            with open(os.path.join(tmp, ".gitignore"), "w") as f:
+                f.write(".scratch/\n")
+            subprocess.run(["git", "-C", tmp, "add", ".gitignore"],
+                           check=True, capture_output=True)
+            subprocess.run(["git", "-C", tmp, "commit", "-q", "-m", "ignore"],
+                           check=True, capture_output=True)
+            os.mkdir(os.path.join(tmp, ".scratch"))
+            with open(os.path.join(tmp, ".scratch", "notes.md"), "w") as f:
+                f.write("x")
+            self.assertIsNone(subtree._check_uncommitted_changes(tmp))
+            captured = self._patch_dialog(True)
+            ok, reason = subtree._confirm_safe_removal(tmp, "master")
+            self.assertFalse(ok)
+            self.assertIn(".scratch", reason)
             self.assertEqual(captured, [])
 
     def test_no_upstream_no_unique_commits_silent(self):

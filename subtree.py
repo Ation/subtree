@@ -15,6 +15,7 @@ CONFIG_FILENAME = "subtree_config.json"
 WORKTREES_DIRNAME = "worktrees"
 SUBLIME_PROJECTS_DIRNAME = "sublime_projects"
 RESERVED_DIRNAMES = (WORKTREES_DIRNAME, SUBLIME_PROJECTS_DIRNAME)
+SCRATCH_DIRNAME = ".scratch"
 
 _INVALID_REPO_NAME_RE = re.compile(r"[\\/]|[\x00-\x1f]")
 _COPY_GLOB_MAGIC = re.compile(r"[*?\[]")
@@ -769,6 +770,23 @@ def _filter_openable(candidates, existing_worktree_names, local_branch_names):
     return result
 
 
+def _check_scratch_dir(worktree_dir):
+    """R060018. Return error message if `<worktree>/.scratch` is non-empty, else None."""
+    scratch = os.path.join(worktree_dir, SCRATCH_DIRNAME)
+    if not os.path.isdir(scratch):
+        return None
+    try:
+        has_entries = any(True for _ in os.scandir(scratch))
+    except OSError as e:
+        return "Could not inspect {}: {}".format(scratch, e)
+    if has_entries:
+        return (
+            "Worktree has a non-empty {} directory ({}). Empty or move it "
+            "before removing the worktree.".format(SCRATCH_DIRNAME, scratch)
+        )
+    return None
+
+
 def _check_uncommitted_changes(worktree_dir):
     """R060008. Run `git status --porcelain`. Return error message or None.
 
@@ -951,10 +969,16 @@ def _git_worktree_remove(git_cwd, worktree_dir):
 def _confirm_safe_removal(worktree_dir, worktree_name):
     """Run all pre-removal checks. Returns (ok: bool, error_message_or_None).
 
-    Wraps R060008, R060009, R060010 (per R060011 — single entry point for
+    Wraps R060018, R060008, R060009, R060010 (per R060011 — single entry point for
     every pre-check and approval prompt). May open synchronous
     `sublime.ok_cancel_dialog` boxes for the no-upstream and ahead prompts.
     """
+    # R060018: non-empty .scratch is a hard block; it is usually gitignored,
+    # so R060008 would not catch it and `git worktree remove` would delete it.
+    err = _check_scratch_dir(worktree_dir)
+    if err is not None:
+        return False, err
+
     # R060008: uncommitted changes are a hard block.
     err = _check_uncommitted_changes(worktree_dir)
     if err is not None:
@@ -1745,7 +1769,7 @@ class SubtreeRemoveCommand(sublime_plugin.WindowCommand):
             )
             return
 
-        # R060008 / R060009 / R060010 / R060011: all pre-checks under one roof.
+        # R060018 / R060008 / R060009 / R060010 / R060011: all pre-checks under one roof.
         ok, reason = _confirm_safe_removal(worktree_dir, worktree_name)
         if not ok:
             sublime.error_message("Subtree: {}".format(reason))
