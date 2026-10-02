@@ -68,6 +68,10 @@ Replacement, inside a file's contents, of the [source worktree](#source-worktree
 
 A regular (non-symlink) file in a newly created [worktree directory](#worktree-directory) that is subject to the [path rewrite](#path-rewrite) of [R030023](requirements.md#3-create-operation): it is either tracked in the worktree's git index or lies inside a directory copied per `settings.copy_directories`, and its name ends in one of the extensions listed in Subtree's source code. Files without an extension are never rewritable.
 
+### Protected directory
+
+A directory, given as a path relative to a [worktree directory](#worktree-directory) in `settings.protected_directories` of the [Subtree config file](#subtree-config-file), whose non-empty presence blocks [`remove`](requirements.md#6-remove-operation) ([R060018](requirements.md#6-remove-operation)). None by default.
+
 ### Subtree config file
 
 [`subtree_config.json`](schemas/subtree_config.md) at the root directory; the source of truth for Subtree's view of the repository.

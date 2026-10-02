@@ -71,42 +71,86 @@ def _add_worktree(root, config, main_dir, branch_name):
     return new_worktree_dir, new_project_path
 
 
-class TestCheckScratchDir(unittest.TestCase):
-    """R060018 — non-empty `.scratch` in the worktree root blocks removal."""
+class TestCheckProtectedDirs(unittest.TestCase):
+    """R060018 — non-empty protected directories in the worktree root block removal."""
 
-    def test_missing_scratch_returns_none(self):
+    def test_missing_dir_returns_none(self):
         with tempfile.TemporaryDirectory() as tmp:
-            self.assertIsNone(subtree._check_scratch_dir(tmp))
+            self.assertIsNone(subtree._check_protected_dirs(tmp, [".scratch"]))
 
-    def test_empty_scratch_returns_none(self):
+    def test_empty_dir_returns_none(self):
         with tempfile.TemporaryDirectory() as tmp:
             os.mkdir(os.path.join(tmp, ".scratch"))
-            self.assertIsNone(subtree._check_scratch_dir(tmp))
+            self.assertIsNone(subtree._check_protected_dirs(tmp, [".scratch"]))
 
-    def test_scratch_file_not_dir_returns_none(self):
+    def test_file_not_dir_returns_none(self):
         with tempfile.TemporaryDirectory() as tmp:
             with open(os.path.join(tmp, ".scratch"), "w") as f:
                 f.write("x")
-            self.assertIsNone(subtree._check_scratch_dir(tmp))
+            self.assertIsNone(subtree._check_protected_dirs(tmp, [".scratch"]))
 
-    def test_scratch_with_file_blocks(self):
+    def test_dir_with_file_blocks(self):
         with tempfile.TemporaryDirectory() as tmp:
             os.mkdir(os.path.join(tmp, ".scratch"))
             with open(os.path.join(tmp, ".scratch", "notes.md"), "w") as f:
                 f.write("x")
-            self.assertIn(".scratch", subtree._check_scratch_dir(tmp))
+            self.assertIn(".scratch", subtree._check_protected_dirs(tmp, [".scratch"]))
 
-    def test_scratch_with_hidden_entry_blocks(self):
+    def test_dir_with_hidden_entry_blocks(self):
         with tempfile.TemporaryDirectory() as tmp:
             os.makedirs(os.path.join(tmp, ".scratch", ".hidden"))
-            self.assertIsNotNone(subtree._check_scratch_dir(tmp))
+            self.assertIsNotNone(subtree._check_protected_dirs(tmp, [".scratch"]))
 
-    def test_nested_scratch_does_not_block(self):
+    def test_nested_same_name_does_not_block(self):
         with tempfile.TemporaryDirectory() as tmp:
             os.makedirs(os.path.join(tmp, "sub", ".scratch"))
             with open(os.path.join(tmp, "sub", ".scratch", "x"), "w") as f:
                 f.write("x")
-            self.assertIsNone(subtree._check_scratch_dir(tmp))
+            self.assertIsNone(subtree._check_protected_dirs(tmp, [".scratch"]))
+
+    def test_nested_entry_path_blocks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "data", "local", "keep"))
+            self.assertIn(
+                "data/local", subtree._check_protected_dirs(tmp, ["data/local"])
+            )
+
+    def test_unlisted_dir_does_not_block(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, ".scratch", "x"))
+            self.assertIsNone(subtree._check_protected_dirs(tmp, [".notes"]))
+
+    def test_empty_list_never_blocks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, ".scratch", "x"))
+            self.assertIsNone(subtree._check_protected_dirs(tmp, []))
+
+    def test_all_blocking_dirs_reported(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, ".scratch", "x"))
+            os.makedirs(os.path.join(tmp, ".notes", "y"))
+            os.mkdir(os.path.join(tmp, ".empty"))
+            msg = subtree._check_protected_dirs(tmp, [".scratch", ".empty", ".notes"])
+            self.assertIn(".scratch", msg)
+            self.assertIn(".notes", msg)
+            self.assertNotIn(".empty", msg)
+
+
+class TestGetProtectedDirectories(unittest.TestCase):
+    """R060018 — `settings.protected_directories` comes from subtree_config.json."""
+
+    def test_missing_settings_returns_empty(self):
+        self.assertEqual(subtree._get_protected_directories({}), [])
+
+    def test_absent_key_returns_empty(self):
+        config = {"settings": {"copy_directories": [".venv"]}}
+        self.assertEqual(subtree._get_protected_directories(config), [])
+
+    def test_configured_list_used(self):
+        config = {"settings": {"protected_directories": [".notes", "data/local"]}}
+        self.assertEqual(
+            subtree._get_protected_directories(config), [".notes", "data/local"]
+        )
 
 
 class TestCheckUncommittedChanges(unittest.TestCase):
@@ -561,7 +605,7 @@ class TestConfirmSafeRemoval(unittest.TestCase):
                 check=True, capture_output=True,
             )
             captured = self._patch_dialog(False)  # would fail if called
-            ok, reason = subtree._confirm_safe_removal(tmp, "master")
+            ok, reason = subtree._confirm_safe_removal(tmp, "master", [".scratch"])
             self.assertTrue(ok)
             self.assertIsNone(reason)
             self.assertEqual(captured, [])
@@ -572,7 +616,7 @@ class TestConfirmSafeRemoval(unittest.TestCase):
             with open(os.path.join(tmp, "extra.txt"), "w") as f:
                 f.write("x")
             captured = self._patch_dialog(True)
-            ok, reason = subtree._confirm_safe_removal(tmp, "master")
+            ok, reason = subtree._confirm_safe_removal(tmp, "master", [".scratch"])
             self.assertFalse(ok)
             self.assertIn("uncommitted", reason.lower())
             self.assertEqual(captured, [])
@@ -591,7 +635,7 @@ class TestConfirmSafeRemoval(unittest.TestCase):
                 f.write("x")
             self.assertIsNone(subtree._check_uncommitted_changes(tmp))
             captured = self._patch_dialog(True)
-            ok, reason = subtree._confirm_safe_removal(tmp, "master")
+            ok, reason = subtree._confirm_safe_removal(tmp, "master", [".scratch"])
             self.assertFalse(ok)
             self.assertIn(".scratch", reason)
             self.assertEqual(captured, [])
@@ -604,7 +648,7 @@ class TestConfirmSafeRemoval(unittest.TestCase):
                 check=True, capture_output=True,
             )
             captured = self._patch_dialog(False)  # would fail if called
-            ok, reason = subtree._confirm_safe_removal(tmp, "feature")
+            ok, reason = subtree._confirm_safe_removal(tmp, "feature", [".scratch"])
             self.assertTrue(ok)
             self.assertIsNone(reason)
             self.assertEqual(captured, [])
@@ -627,7 +671,7 @@ class TestConfirmSafeRemoval(unittest.TestCase):
                 check=True, capture_output=True,
             )
             captured = self._patch_dialog(True)
-            ok, reason = subtree._confirm_safe_removal(tmp, "feature")
+            ok, reason = subtree._confirm_safe_removal(tmp, "feature", [".scratch"])
             self.assertTrue(ok)
             self.assertIsNone(reason)
             self.assertEqual(len(captured), 1)
@@ -651,7 +695,7 @@ class TestConfirmSafeRemoval(unittest.TestCase):
                 check=True, capture_output=True,
             )
             self._patch_dialog(False)
-            ok, reason = subtree._confirm_safe_removal(tmp, "feature")
+            ok, reason = subtree._confirm_safe_removal(tmp, "feature", [".scratch"])
             self.assertFalse(ok)
             self.assertIn("upstream", reason.lower())
 
@@ -686,7 +730,7 @@ class TestConfirmSafeRemoval(unittest.TestCase):
                 check=True, capture_output=True,
             )
             captured = self._patch_dialog(True)
-            ok, reason = subtree._confirm_safe_removal(tmp, "master")
+            ok, reason = subtree._confirm_safe_removal(tmp, "master", [".scratch"])
             self.assertTrue(ok)
             self.assertIsNone(reason)
             self.assertEqual(len(captured), 1)
@@ -723,7 +767,7 @@ class TestConfirmSafeRemoval(unittest.TestCase):
                 check=True, capture_output=True,
             )
             self._patch_dialog(False)
-            ok, reason = subtree._confirm_safe_removal(tmp, "master")
+            ok, reason = subtree._confirm_safe_removal(tmp, "master", [".scratch"])
             self.assertFalse(ok)
             self.assertIn("ahead", reason.lower())
 

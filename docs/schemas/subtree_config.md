@@ -11,7 +11,8 @@ The [Subtree config file](../glossary.md#subtree-config-file) lives at the [root
         "main_worktree": "master"
     },
     "settings": {
-        "copy_directories": [".venv", ".idea"]
+        "copy_directories": [".venv", ".idea"],
+        "protected_directories": [".scratch"]
     },
     "worktrees": [
         {
@@ -74,3 +75,7 @@ At copy time (see [R030021](../requirements.md#3-create-operation) / [R040021](.
 After copying finishes, Subtree rewrites the source worktree's absolute path inside the new worktree's files — both git-tracked files and files under the directories copied here (see [R030023](../requirements.md#3-create-operation) / [R040023](../requirements.md#4-open-operation)). Which files qualify is governed by `REWRITE_FILE_EXTENSIONS` in `subtree.py`, not by this config: the rewrite has no `settings` key.
 
 Intended for local-only artefacts such as Python virtualenvs (`.venv`), IDE caches (`.idea`), or build caches that are slow to rebuild from scratch. [`init`](../requirements.md#2-init-operation) does not write `settings` — it is up to the user to add it after initialising the repository.
+
+### `settings.protected_directories` *(array of strings, optional, default `[]`)*
+
+[Protected directories](../glossary.md#protected-directory): directory paths (relative to a worktree's root) that block [`remove`](../requirements.md#6-remove-operation) while non-empty ([R060018](../requirements.md#6-remove-operation)). Entries follow the same path rules as `settings.copy_directories`, but no glob expansion is performed. An absent key or empty array means no directory is protected.

@@ -15,7 +15,6 @@ CONFIG_FILENAME = "subtree_config.json"
 WORKTREES_DIRNAME = "worktrees"
 SUBLIME_PROJECTS_DIRNAME = "sublime_projects"
 RESERVED_DIRNAMES = (WORKTREES_DIRNAME, SUBLIME_PROJECTS_DIRNAME)
-SCRATCH_DIRNAME = ".scratch"
 
 _INVALID_REPO_NAME_RE = re.compile(r"[\\/]|[\x00-\x1f]")
 _COPY_GLOB_MAGIC = re.compile(r"[*?\[]")
@@ -103,7 +102,8 @@ def _do_init(target, repo_name, branch):
             "main_worktree": branch,
         },
         "settings": {
-          "copy_directories": []
+          "copy_directories": [],
+          "protected_directories": []
         },
         "worktrees": [
             {
@@ -225,20 +225,22 @@ def _read_config(root):
     if settings is not None:
         if not isinstance(settings, dict):
             raise ValueError("subtree_config.json: 'settings' must be an object.")
-        cd = settings.get("copy_directories")
-        if cd is not None:
-            if not isinstance(cd, list):
+        for key in ("copy_directories", "protected_directories"):
+            entries = settings.get(key)
+            if entries is None:
+                continue
+            if not isinstance(entries, list):
                 raise ValueError(
-                    "subtree_config.json: settings.copy_directories must be an array."
+                    "subtree_config.json: settings.{} must be an array.".format(key)
                 )
-            for i, entry in enumerate(cd):
+            for i, entry in enumerate(entries):
                 if not isinstance(entry, str):
                     raise ValueError(
-                        "subtree_config.json: settings.copy_directories[{}] must be a string.".format(i)
+                        "subtree_config.json: settings.{}[{}] must be a string.".format(key, i)
                     )
                 if not _is_valid_relative_subpath(entry):
                     raise ValueError(
-                        "subtree_config.json: settings.copy_directories[{}] is not a valid relative path: {!r}".format(i, entry)
+                        "subtree_config.json: settings.{}[{}] is not a valid relative path: {!r}".format(key, i, entry)
                     )
     return data
 
@@ -247,6 +249,12 @@ def _get_copy_directories(config):
     """Return `settings.copy_directories` from the parsed config, or [] if absent."""
     settings = config.get("settings") or {}
     return settings.get("copy_directories") or []
+
+
+def _get_protected_directories(config):
+    """R060018. Return `settings.protected_directories`, or [] if absent."""
+    settings = config.get("settings") or {}
+    return settings.get("protected_directories") or []
 
 
 def _is_gitignored(worktree_dir, relpath):
@@ -770,19 +778,28 @@ def _filter_openable(candidates, existing_worktree_names, local_branch_names):
     return result
 
 
-def _check_scratch_dir(worktree_dir):
-    """R060018. Return error message if `<worktree>/.scratch` is non-empty, else None."""
-    scratch = os.path.join(worktree_dir, SCRATCH_DIRNAME)
-    if not os.path.isdir(scratch):
-        return None
-    try:
-        has_entries = any(True for _ in os.scandir(scratch))
-    except OSError as e:
-        return "Could not inspect {}: {}".format(scratch, e)
-    if has_entries:
+def _check_protected_dirs(worktree_dir, protected_dirs):
+    """R060018. Return error message if any protected directory is non-empty, else None."""
+    blocking = []
+    for rel in protected_dirs:
+        path = os.path.join(worktree_dir, *rel.split("/"))
+        if not os.path.isdir(path):
+            continue
+        try:
+            has_entries = any(True for _ in os.scandir(path))
+        except OSError as e:
+            return "Could not inspect {}: {}".format(path, e)
+        if has_entries:
+            blocking.append(rel)
+    if blocking:
         return (
-            "Worktree has a non-empty {} directory ({}). Empty or move it "
-            "before removing the worktree.".format(SCRATCH_DIRNAME, scratch)
+            "Worktree has non-empty protected director{} {} in {}. Empty or move "
+            "{} before removing the worktree.".format(
+                "y" if len(blocking) == 1 else "ies",
+                ", ".join(blocking),
+                worktree_dir,
+                "it" if len(blocking) == 1 else "them",
+            )
         )
     return None
 
@@ -966,16 +983,17 @@ def _git_worktree_remove(git_cwd, worktree_dir):
         raise GitError(result.stderr.strip() or "git worktree remove failed.")
 
 
-def _confirm_safe_removal(worktree_dir, worktree_name):
+def _confirm_safe_removal(worktree_dir, worktree_name, protected_dirs):
     """Run all pre-removal checks. Returns (ok: bool, error_message_or_None).
 
     Wraps R060018, R060008, R060009, R060010 (per R060011 — single entry point for
     every pre-check and approval prompt). May open synchronous
     `sublime.ok_cancel_dialog` boxes for the no-upstream and ahead prompts.
     """
-    # R060018: non-empty .scratch is a hard block; it is usually gitignored,
-    # so R060008 would not catch it and `git worktree remove` would delete it.
-    err = _check_scratch_dir(worktree_dir)
+    # R060018: non-empty protected directories are a hard block; they are usually
+    # gitignored, so R060008 would not catch them and `git worktree remove` would
+    # delete them.
+    err = _check_protected_dirs(worktree_dir, protected_dirs)
     if err is not None:
         return False, err
 
@@ -1770,7 +1788,9 @@ class SubtreeRemoveCommand(sublime_plugin.WindowCommand):
             return
 
         # R060018 / R060008 / R060009 / R060010 / R060011: all pre-checks under one roof.
-        ok, reason = _confirm_safe_removal(worktree_dir, worktree_name)
+        ok, reason = _confirm_safe_removal(
+            worktree_dir, worktree_name, _get_protected_directories(config)
+        )
         if not ok:
             sublime.error_message("Subtree: {}".format(reason))
             return

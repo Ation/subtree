@@ -657,7 +657,7 @@ class TestIsValidRelativeSubpath(unittest.TestCase):
 
 
 class TestReadConfigSettings(unittest.TestCase):
-    """R030004 — settings.copy_directories shape validation."""
+    """R030004 — settings.copy_directories / protected_directories shape validation."""
 
     def _write(self, root, data):
         with open(os.path.join(root, subtree.CONFIG_FILENAME), "w") as f:
@@ -733,6 +733,25 @@ class TestReadConfigSettings(unittest.TestCase):
             self._write(tmp, data)
             with self.assertRaises(ValueError):
                 subtree._read_config(tmp)
+
+    def test_accepts_valid_protected_directories(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data = self._base_config()
+            data["settings"] = {"protected_directories": [".scratch", "notes/private"]}
+            self._write(tmp, data)
+            parsed = subtree._read_config(tmp)
+            self.assertEqual(
+                subtree._get_protected_directories(parsed), [".scratch", "notes/private"]
+            )
+
+    def test_rejects_invalid_protected_directories(self):
+        for bad in (".scratch", [".scratch", 42], ["/abs"], ["../escape"], [""]):
+            with self.subTest(bad=bad), tempfile.TemporaryDirectory() as tmp:
+                data = self._base_config()
+                data["settings"] = {"protected_directories": bad}
+                self._write(tmp, data)
+                with self.assertRaises(ValueError):
+                    subtree._read_config(tmp)
 
 
 class TestIsGitignored(unittest.TestCase):
