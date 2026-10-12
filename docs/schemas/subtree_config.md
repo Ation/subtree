@@ -12,7 +12,8 @@ The [Subtree config file](../glossary.md#subtree-config-file) lives at the [root
     },
     "settings": {
         "copy_directories": [".venv", ".idea"],
-        "protected_directories": [".scratch"]
+        "protected_directories": [".scratch"],
+        "copy_uncommitted_changes": false
     },
     "worktrees": [
         {
@@ -57,7 +58,7 @@ Basename of the matching sublime-project file under `sublime_projects/`. Compute
 
 ### `settings` *(object, optional)*
 
-Repository-wide behaviour knobs. The whole object is optional; an absent or empty `settings` means "no settings configured". Unknown keys inside `settings` are reserved for future use and must be preserved on rewrite, but the current implementation will not act on them.
+Repository-wide behaviour knobs. When read, the whole object is optional; an absent or empty `settings` means "every key at its default". [`init`](../requirements.md#2-init-operation) writes the object with every documented key at its default ([R020003](../requirements.md#2-init-operation)), and any operation that rewrites the file fills in absent keys with their defaults ([R010005](../requirements.md#1-restrictions-and-general-requirements)), so a hand-trimmed config grows the keys back on the next write. Unknown keys inside `settings` are reserved for future use and must be preserved on rewrite, but the current implementation will not act on them.
 
 ### `settings.copy_directories` *(array of strings, optional, default `[]`)*
 
@@ -74,8 +75,14 @@ At copy time (see [R030021](../requirements.md#3-create-operation) / [R040021](.
 
 After copying finishes, Subtree rewrites the source worktree's absolute path inside the new worktree's files — both git-tracked files and files under the directories copied here (see [R030023](../requirements.md#3-create-operation) / [R040023](../requirements.md#4-open-operation)). Which files qualify is governed by `REWRITE_FILE_EXTENSIONS` in `subtree.py`, not by this config: the rewrite has no `settings` key.
 
-Intended for local-only artefacts such as Python virtualenvs (`.venv`), IDE caches (`.idea`), or build caches that are slow to rebuild from scratch. [`init`](../requirements.md#2-init-operation) does not write `settings` — it is up to the user to add it after initialising the repository.
+Intended for local-only artefacts such as Python virtualenvs (`.venv`), IDE caches (`.idea`), or build caches that are slow to rebuild from scratch.
 
 ### `settings.protected_directories` *(array of strings, optional, default `[]`)*
 
 [Protected directories](../glossary.md#protected-directory): directory paths (relative to a worktree's root) that block [`remove`](../requirements.md#6-remove-operation) while non-empty ([R060018](../requirements.md#6-remove-operation)). Entries follow the same path rules as `settings.copy_directories`, but no glob expansion is performed. An absent key or empty array means no directory is protected.
+
+### `settings.copy_uncommitted_changes` *(boolean, optional, default `false`)*
+
+When `true`, [`create`](../requirements.md#3-create-operation) carries the [source worktree](../glossary.md#source-worktree)'s [uncommitted changes](../glossary.md#uncommitted-change) into the new worktree before the path rewrite runs ([R030024](../requirements.md#3-create-operation)): modified, staged, renamed, and untracked files are copied as working-tree content, and files deleted in the source are deleted in the new worktree. Everything arrives unstaged. Gitignored files are never part of this set (use `settings.copy_directories` for those) and submodules are ignored ([R010004](../requirements.md#1-restrictions-and-general-requirements)).
+
+The key has no effect on [`open`](../requirements.md#4-open-operation) ([R040024](../requirements.md#4-open-operation)). A present value that is not a JSON boolean is a schema error and aborts the operation ([R030004](../requirements.md#3-create-operation)).

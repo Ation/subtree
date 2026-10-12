@@ -209,3 +209,22 @@ class TestDoInit(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestInitSettingsDefaults(unittest.TestCase):
+    """R020003.4 — init writes every documented settings key at its default."""
+
+    def test_all_settings_keys_written_with_defaults(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _init_git_repo(tmp, initial_branch="master")
+            subtree._do_init(tmp, "my_app", "master")
+            with open(os.path.join(tmp, "subtree_config.json")) as f:
+                config = json.load(f)
+            self.assertEqual(
+                config["settings"],
+                {
+                    "copy_directories": [],
+                    "protected_directories": [],
+                    "copy_uncommitted_changes": False,
+                },
+            )

@@ -17,6 +17,14 @@ SUBLIME_PROJECTS_DIRNAME = "sublime_projects"
 RESERVED_DIRNAMES = (WORKTREES_DIRNAME, SUBLIME_PROJECTS_DIRNAME)
 
 _INVALID_REPO_NAME_RE = re.compile(r"[\\/]|[\x00-\x1f]")
+
+# Every documented `settings` key with its default. `init` writes all of them
+# (R020003.4) and every config rewrite fills absent ones back in (R010005).
+SETTINGS_DEFAULTS = (
+    ("copy_directories", lambda: []),
+    ("protected_directories", lambda: []),
+    ("copy_uncommitted_changes", lambda: False),
+)
 _COPY_GLOB_MAGIC = re.compile(r"[*?\[]")
 
 # R030023: filename suffixes eligible for a path rewrite in a new worktree.
@@ -65,6 +73,27 @@ def _write_json(path, data):
         f.write("\n")
 
 
+def _normalize_settings(config):
+    """R010005: fill absent `settings` keys with their defaults, in place.
+
+    Present keys (including unknown ones) are left untouched.
+    """
+    settings = config.get("settings")
+    if not isinstance(settings, dict):
+        settings = {}
+        config["settings"] = settings
+    for key, default in SETTINGS_DEFAULTS:
+        if key not in settings:
+            settings[key] = default()
+    return config
+
+
+def _write_config(root, config):
+    """Rewrite subtree_config.json with absent settings normalised in (R010005)."""
+    _normalize_settings(config)
+    _write_json(os.path.join(root, CONFIG_FILENAME), config)
+
+
 def _preflight(target):
     """Validate `target` for init. Returns (error_message, r_code) or (None, None)."""
     if not os.path.isdir(os.path.join(target, ".git")):
@@ -101,10 +130,7 @@ def _do_init(target, repo_name, branch):
             "repository_name": repo_name,
             "main_worktree": branch,
         },
-        "settings": {
-          "copy_directories": [],
-          "protected_directories": []
-        },
+        "settings": {},
         "worktrees": [
             {
                 "name": branch,
@@ -113,7 +139,7 @@ def _do_init(target, repo_name, branch):
             },
         ],
     }
-    _write_json(os.path.join(target, CONFIG_FILENAME), config)
+    _write_config(target, config)  # R020003.4: every settings key at its default
 
     project_path = os.path.join(sublime_projects_dir, project_filename)
     _write_json(project_path, {"folders": [{"path": main_worktree_dir}]})
@@ -242,6 +268,11 @@ def _read_config(root):
                     raise ValueError(
                         "subtree_config.json: settings.{}[{}] is not a valid relative path: {!r}".format(key, i, entry)
                     )
+        flag = settings.get("copy_uncommitted_changes")
+        if flag is not None and not isinstance(flag, bool):
+            raise ValueError(
+                "subtree_config.json: settings.copy_uncommitted_changes must be a boolean."
+            )
     return data
 
 
@@ -255,6 +286,12 @@ def _get_protected_directories(config):
     """R060018. Return `settings.protected_directories`, or [] if absent."""
     settings = config.get("settings") or {}
     return settings.get("protected_directories") or []
+
+
+def _get_copy_uncommitted_changes(config):
+    """R030024. Return `settings.copy_uncommitted_changes`, or False if absent."""
+    settings = config.get("settings") or {}
+    return bool(settings.get("copy_uncommitted_changes", False))
 
 
 def _is_gitignored(worktree_dir, relpath):
@@ -409,6 +446,109 @@ def _copy_listed_directories(source_dir, new_dir, entries, progress=None,
     return warnings
 
 
+def _git_uncommitted_paths(worktree_dir):
+    """R030024.1: list the worktree's uncommitted changes as relative paths.
+
+    Wraps `git status --porcelain -z -uall --ignore-submodules=all`, so
+    untracked files are listed one by one, gitignored files are absent, and
+    submodules are ignored (R010004). A rename or copy entry contributes both
+    its new path and its original path. Raises GitError if git is missing or
+    the invocation fails.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "-C", worktree_dir, "status", "--porcelain=v1", "-z",
+             "-uall", "--ignore-submodules=all"],
+            capture_output=True,
+        )
+    except FileNotFoundError:
+        raise GitError("`git` was not found on PATH.")
+    if result.returncode != 0:
+        stderr = result.stderr.decode("utf-8", "replace").strip()
+        raise GitError(
+            "git status failed: " + (stderr or "exit {}".format(result.returncode))
+        )
+    tokens = [t for t in result.stdout.split(b"\0") if t]
+    paths = []
+    i = 0
+    while i < len(tokens):
+        status = tokens[i][:2]
+        paths.append(tokens[i][3:].decode("utf-8", "surrogateescape"))
+        i += 1
+        # Porcelain v1 with -z emits the original path as a separate token
+        # right after a rename/copy entry.
+        if (b"R" in status or b"C" in status) and i < len(tokens):
+            paths.append(tokens[i].decode("utf-8", "surrogateescape"))
+            i += 1
+    return paths
+
+
+def _copy_uncommitted_changes(source_dir, new_dir, progress=None):
+    """R030024: carry `source_dir`'s uncommitted changes into `new_dir`.
+
+    For each path git reports: if it exists in `source_dir` it is copied over
+    (symlinks reproduced, mode preserved, any existing file overwritten); if
+    it is gone from `source_dir` it is deleted from `new_dir`, silently when
+    already absent. Directories (e.g. an embedded repository) are skipped.
+    Only working-tree content moves; nothing is staged in `new_dir`.
+
+    Returns `(copied, deleted, warnings)` where `copied` lists the relative
+    paths that now exist in `new_dir` because of this step (R030023 candidates)
+    and `deleted` is the number of paths removed. Never raises: a git failure
+    or a per-path OSError becomes a warning (R030022).
+
+    `progress`, if given, follows the `_copy_listed_directories` contract.
+    """
+    warnings = []
+    try:
+        paths = _git_uncommitted_paths(source_dir)
+    except GitError as e:
+        warnings.append("uncommitted changes: could not list changes: {}".format(e))
+        return [], 0, warnings
+
+    copied = []
+    deleted = 0
+    seen = set()
+    total = len(paths)
+    if progress is not None and total:
+        progress("uncommitted changes", 0, total)
+    for done, rel in enumerate(paths, 1):
+        if rel in seen:
+            continue
+        seen.add(rel)
+        parts = rel.split("/")
+        src = os.path.join(source_dir, *parts)
+        dst = os.path.join(new_dir, *parts)
+        try:
+            if os.path.islink(src):
+                _replace_with_symlink(dst, os.readlink(src))
+                copied.append(rel)
+            elif os.path.isfile(src):
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                if os.path.islink(dst):
+                    os.remove(dst)  # never write through a checkout's symlink
+                shutil.copy2(src, dst)
+                copied.append(rel)
+            elif os.path.isdir(src):
+                continue  # R030024.2: directories (embedded repos) are skipped
+            elif os.path.lexists(dst):
+                os.remove(dst)
+                deleted += 1
+        except OSError as e:
+            warnings.append("uncommitted changes: failed on {!r}: {}".format(rel, e))
+        if progress is not None:
+            progress("uncommitted changes", done, total)
+    return copied, deleted, warnings
+
+
+def _replace_with_symlink(dst, target):
+    """Create symlink `dst` -> `target`, replacing any existing file or link."""
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    if os.path.lexists(dst):
+        os.remove(dst)
+    os.symlink(target, dst)
+
+
 def _has_rewritable_extension(name):
     """Return True iff `name` ends in one of `REWRITE_FILE_EXTENSIONS` (R030023).
 
@@ -486,11 +626,12 @@ def _walk_relative_files(new_dir, rel_dir):
             yield os.path.relpath(full, new_dir).replace(os.sep, "/")
 
 
-def _rewrite_worktree_paths(new_dir, source_dir, copied_dirs=()):
+def _rewrite_worktree_paths(new_dir, source_dir, copied_dirs=(), copied_files=()):
     """R030023: swap `source_dir` for `new_dir` inside the new worktree's files.
 
-    Candidates are the new worktree's tracked files plus every file under each
-    directory in `copied_dirs` (relative paths of entries copied per R030021).
+    Candidates are the new worktree's tracked files, every file under each
+    directory in `copied_dirs` (relative paths of entries copied per R030021),
+    and every relative path in `copied_files` (carried per R030024).
     A candidate is a rewritable file only if it is a regular non-symlink file
     whose name satisfies `_has_rewritable_extension`; the substitution follows
     `_rewrite_path_bytes`, and a file is written back only when it changed.
@@ -509,6 +650,7 @@ def _rewrite_worktree_paths(new_dir, source_dir, copied_dirs=()):
         warnings.append("path rewrite: could not list tracked files: {}".format(e))
     for rel_dir in copied_dirs:
         candidates.extend(_walk_relative_files(new_dir, rel_dir))
+    candidates.extend(copied_files)
 
     old_bytes = source_dir.encode("utf-8", "surrogateescape")
     new_bytes = new_dir.encode("utf-8", "surrogateescape")
@@ -645,26 +787,30 @@ def _resolve_base_branch(source_dir, branch):
 def _do_create(git_cwd, source_name, source_template,
                new_worktree_dir, new_project_path,
                branch, base_branch, project_filename, root, config,
-               copy_directories=(), copy_progress=None, on_rewritten=None):
+               copy_directories=(), copy_progress=None, on_rewritten=None,
+               copy_uncommitted=False, on_changes_carried=None):
     """Side-effecting orchestration. Order matters:
 
     1. `git worktree add` (R030014 / R030015) — failure leaves Subtree state untouched.
     2. Write new sublime-project file (R030017).
     3. Append config entry and rewrite subtree_config.json (R030018).
     4. Copy gitignored directories from the source worktree (R030021 / R040021).
-    5. Rewrite the source worktree path inside the new worktree (R030023 / R040023).
+    5. If `copy_uncommitted`, carry the source worktree's uncommitted changes
+       (R030024). Only `create` sets this; `open` never does (R040024).
+    6. Rewrite the source worktree path inside the new worktree (R030023 / R040023).
 
     `git_cwd` is only the working directory for git: `open` passes the main
     worktree because that is where its base ref resolves (R040015 / R040016).
-    Steps 2, 4, and 5 all key off `<root>/worktrees/<source_name>`, which is
-    the source worktree for `create` and the template-source worktree for
+    Steps 2, 4, 5, and 6 all key off `<root>/worktrees/<source_name>`, which
+    is the source worktree for `create` and the template-source worktree for
     `open`.
 
     Raises GitError on git failure (no Subtree files written), OSError on a
     later write failure (worktree dir already exists on disk). Returns a list
-    of warnings from steps 4-5 — non-empty lists do not roll back steps 1-3
-    (R030022 / R040022). `on_rewritten`, if given, receives the number of
-    files step 5 changed.
+    of warnings from steps 4-6 — non-empty lists do not roll back steps 1-3
+    (R030022 / R040022). `on_changes_carried`, if given, receives the number
+    of paths step 5 copied or deleted; `on_rewritten` receives the number of
+    files step 6 changed.
     """
     # R010002: branches with '/' produce nested paths under worktrees/. Ensure
     # the parent directory exists before invoking git (git already does this,
@@ -685,7 +831,7 @@ def _do_create(git_cwd, source_name, source_template,
         "created_from": source_name,
         "project_file": project_filename,
     })
-    _write_json(os.path.join(root, CONFIG_FILENAME), config)
+    _write_config(root, config)
 
     copied = []
     warnings = _copy_listed_directories(
@@ -693,8 +839,18 @@ def _do_create(git_cwd, source_name, source_template,
         progress=copy_progress, on_copied=copied.append,
     )
 
+    copied_files = []
+    if copy_uncommitted:
+        copied_files, deleted, change_warnings = _copy_uncommitted_changes(
+            template_worktree_dir, new_worktree_dir, progress=copy_progress,
+        )
+        warnings += change_warnings
+        if on_changes_carried is not None:
+            on_changes_carried(len(copied_files) + deleted)
+
     count, rewrite_warnings = _rewrite_worktree_paths(
-        new_worktree_dir, template_worktree_dir, copied_dirs=copied,
+        new_worktree_dir, template_worktree_dir,
+        copied_dirs=copied, copied_files=copied_files,
     )
     if on_rewritten is not None:
         on_rewritten(count)
@@ -1052,7 +1208,7 @@ def _do_remove(root, config, entry, worktree_dir, main_dir):
     config["worktrees"] = [
         wt for wt in config["worktrees"] if wt["name"] != entry["name"]
     ]
-    _write_json(os.path.join(root, CONFIG_FILENAME), config)
+    _write_config(root, config)
     return cleanup
 
 
@@ -1109,7 +1265,7 @@ def _do_prune(root, config, stale_entries):
     config["worktrees"] = [
         wt for wt in config["worktrees"] if wt["name"] not in stale_names
     ]
-    _write_json(os.path.join(root, CONFIG_FILENAME), config)
+    _write_config(root, config)
     return results, warnings
 
 
@@ -1220,6 +1376,19 @@ def _status_rewrite_callback(op_label):
         if count > 0:
             sublime.status_message(
                 "Subtree ({}): rewrote worktree path in {} file(s)".format(
+                    op_label, count,
+                )
+            )
+    return _cb
+
+
+def _status_changes_callback(op_label):
+    """Return an `on_changes_carried(count)` callback for R030024.5. Silent
+    when the source worktree was clean."""
+    def _cb(count):
+        if count > 0:
+            sublime.status_message(
+                "Subtree ({}): carried {} uncommitted change(s) from source worktree".format(
                     op_label, count,
                 )
             )
@@ -1442,6 +1611,8 @@ class SubtreeCreateCommand(sublime_plugin.WindowCommand):
                 copy_directories=_get_copy_directories(config),
                 copy_progress=_status_progress_callback("Create"),
                 on_rewritten=_status_rewrite_callback("Create"),
+                copy_uncommitted=_get_copy_uncommitted_changes(config),
+                on_changes_carried=_status_changes_callback("Create"),
             )
         except GitError as e:
             sublime.error_message(

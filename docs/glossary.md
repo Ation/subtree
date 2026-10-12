@@ -66,7 +66,11 @@ Replacement, inside a file's contents, of the [source worktree](#source-worktree
 
 ### Rewritable file
 
-A regular (non-symlink) file in a newly created [worktree directory](#worktree-directory) that is subject to the [path rewrite](#path-rewrite) of [R030023](requirements.md#3-create-operation): it is either tracked in the worktree's git index or lies inside a directory copied per `settings.copy_directories`, and its name ends in one of the extensions listed in Subtree's source code. Files without an extension are never rewritable.
+A regular (non-symlink) file in a newly created [worktree directory](#worktree-directory) that is subject to the [path rewrite](#path-rewrite) of [R030023](requirements.md#3-create-operation): it is either tracked in the worktree's git index, lies inside a directory copied per `settings.copy_directories`, or was copied as an [uncommitted change](#uncommitted-change) per `settings.copy_uncommitted_changes`, and its name ends in one of the extensions listed in Subtree's source code. Files without an extension are never rewritable.
+
+### Uncommitted change
+
+A path in a [worktree directory](#worktree-directory) that `git status --porcelain` reports: a tracked file that is modified, staged, renamed, or deleted relative to `HEAD`, or an untracked file that is not gitignored. Gitignored files are never uncommitted changes (they are the domain of `settings.copy_directories`). Submodules are out of scope for Subtree ([R010004](requirements.md#1-restrictions-and-general-requirements)), so `create` ignores changed submodules when carrying uncommitted changes. [`remove`](requirements.md#6-remove-operation) refuses to delete a worktree that has uncommitted changes ([R060008](requirements.md#6-remove-operation)); [`create`](requirements.md#3-create-operation) can carry the [source worktree](#source-worktree)'s uncommitted changes into the new worktree when `settings.copy_uncommitted_changes` is enabled ([R030024](requirements.md#3-create-operation)).
 
 ### Protected directory
 

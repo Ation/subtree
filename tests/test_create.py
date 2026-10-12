@@ -1546,3 +1546,239 @@ class TestDoCreateRewritesPaths(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def _git(cwd, *args):
+    return subprocess.run(
+        ["git", "-C", cwd] + list(args), check=True, capture_output=True, text=True,
+    ).stdout
+
+
+def _write(path, content):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        f.write(content)
+
+
+def _read(path):
+    with open(path) as f:
+        return f.read()
+
+
+class TestCopyUncommittedChangesSetting(unittest.TestCase):
+    """R010005 / R030004 — the `settings.copy_uncommitted_changes` key."""
+
+    def test_read_config_rejects_non_boolean(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, config = _make_subtree_repo(tmp)
+            config["settings"]["copy_uncommitted_changes"] = "yes"
+            subtree._write_json(os.path.join(root, subtree.CONFIG_FILENAME), config)
+            with self.assertRaises(ValueError):
+                subtree._read_config(root)
+
+    def test_read_config_accepts_absent_key(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, config = _make_subtree_repo(tmp)
+            del config["settings"]["copy_uncommitted_changes"]
+            subtree._write_json(os.path.join(root, subtree.CONFIG_FILENAME), config)
+            loaded = subtree._read_config(root)
+            self.assertFalse(subtree._get_copy_uncommitted_changes(loaded))
+
+    def test_write_config_fills_absent_keys_and_keeps_present_ones(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, config = _make_subtree_repo(tmp)
+            config["settings"] = {"copy_directories": [".venv"], "custom": 1}
+            subtree._write_config(root, config)
+            with open(os.path.join(root, subtree.CONFIG_FILENAME)) as f:
+                written = json.load(f)
+            self.assertEqual(
+                written["settings"],
+                {
+                    "copy_directories": [".venv"],
+                    "custom": 1,
+                    "protected_directories": [],
+                    "copy_uncommitted_changes": False,
+                },
+            )
+
+    def test_write_config_creates_missing_settings_object(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, config = _make_subtree_repo(tmp)
+            del config["settings"]
+            subtree._write_config(root, config)
+            with open(os.path.join(root, subtree.CONFIG_FILENAME)) as f:
+                written = json.load(f)
+            self.assertIn("copy_uncommitted_changes", written["settings"])
+
+    def test_create_normalises_hand_trimmed_config(self):
+        """R030018 goes through the R010005 normalisation."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root, config = _make_subtree_repo(tmp)
+            del config["settings"]
+            subtree._write_json(os.path.join(root, subtree.CONFIG_FILENAME), config)
+            config = subtree._read_config(root)
+            TestDoCreate._call_create(TestDoCreate(), root, config, "master", "feature_1")
+            with open(os.path.join(root, subtree.CONFIG_FILENAME)) as f:
+                written = json.load(f)
+            self.assertEqual(written["settings"]["copy_uncommitted_changes"], False)
+            self.assertEqual(written["settings"]["copy_directories"], [])
+
+
+class TestCopyUncommittedChanges(unittest.TestCase):
+    """R030024 — carry the source worktree's uncommitted changes into the new one."""
+
+    def _create(self, root, config, branch, enabled=True):
+        """Run _do_create from `master` with the R030024 flag set as requested."""
+        source_dir = os.path.join(root, "worktrees", "master")
+        template = subtree._load_source_template(
+            os.path.join(root, "sublime_projects", "my_app_master.sublime-project")
+        )
+        new_dir = os.path.join(root, "worktrees", branch)
+        project_filename = "my_app_{}.sublime-project".format(branch)
+        base_branch, err = subtree._resolve_base_branch(source_dir, branch)
+        self.assertIsNone(err)
+        carried = []
+        warnings = subtree._do_create(
+            source_dir, "master", template, new_dir,
+            os.path.join(root, "sublime_projects", project_filename),
+            branch, base_branch, project_filename, root, config,
+            copy_uncommitted=enabled, on_changes_carried=carried.append,
+        )
+        return new_dir, warnings, carried
+
+    def test_disabled_by_default_leaves_clean_checkout(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, config = _make_subtree_repo(tmp)
+            src = os.path.join(root, "worktrees", "master")
+            _write(os.path.join(src, "README.md"), "changed\n")
+            _write(os.path.join(src, "new.txt"), "untracked\n")
+
+            new_dir, warnings, carried = self._create(root, config, "feature_1", enabled=False)
+
+            self.assertEqual(warnings, [])
+            self.assertEqual(carried, [])
+            self.assertEqual(_read(os.path.join(new_dir, "README.md")), "hello\n")
+            self.assertFalse(os.path.exists(os.path.join(new_dir, "new.txt")))
+            self.assertEqual(_git(new_dir, "status", "--porcelain"), "")
+
+    def test_modified_untracked_and_deleted_paths_are_carried(self):
+        """R030024.2 — copy modified + untracked, delete deleted; nothing staged (R030024.3)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root, config = _make_subtree_repo(tmp)
+            src = os.path.join(root, "worktrees", "master")
+            _write(os.path.join(src, "tracked.txt"), "v1\n")
+            _write(os.path.join(src, "gone.txt"), "bye\n")
+            _git(src, "add", "tracked.txt", "gone.txt")
+            _git(src, "commit", "-q", "-m", "more files")
+
+            _write(os.path.join(src, "README.md"), "changed\n")       # unstaged modification
+            _write(os.path.join(src, "tracked.txt"), "v2\n")
+            _git(src, "add", "tracked.txt")                            # staged modification
+            os.remove(os.path.join(src, "gone.txt"))                   # deletion
+            _write(os.path.join(src, "nested", "deep", "new.txt"), "untracked\n")
+            _write(os.path.join(src, ".gitignore"), "ignored.txt\n")   # untracked .gitignore itself
+            _write(os.path.join(src, "ignored.txt"), "ignored\n")      # gitignored → not carried
+
+            new_dir, warnings, carried = self._create(root, config, "feature_1")
+
+            self.assertEqual(warnings, [])
+            self.assertEqual(_read(os.path.join(new_dir, "README.md")), "changed\n")
+            self.assertEqual(_read(os.path.join(new_dir, "tracked.txt")), "v2\n")
+            self.assertFalse(os.path.exists(os.path.join(new_dir, "gone.txt")))
+            self.assertEqual(_read(os.path.join(new_dir, "nested", "deep", "new.txt")), "untracked\n")
+            self.assertTrue(os.path.isfile(os.path.join(new_dir, ".gitignore")))
+            self.assertFalse(os.path.exists(os.path.join(new_dir, "ignored.txt")))
+            # README, tracked.txt, gone.txt, nested/deep/new.txt, .gitignore
+            self.assertEqual(carried, [5])
+
+            status = _git(new_dir, "status", "--porcelain")
+            lines = sorted(status.splitlines())
+            self.assertEqual(lines, sorted([
+                " M README.md",
+                " M tracked.txt",
+                " D gone.txt",
+                "?? .gitignore",
+                "?? nested/",
+            ]))
+            # Source worktree is untouched by the operation.
+            self.assertEqual(_read(os.path.join(src, "tracked.txt")), "v2\n")
+
+    def test_staged_rename_is_carried_as_delete_plus_copy(self):
+        """R030024.1 — both halves of a rename entry are processed."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root, config = _make_subtree_repo(tmp)
+            src = os.path.join(root, "worktrees", "master")
+            _git(src, "mv", "README.md", "RENAMED.md")
+
+            new_dir, warnings, _ = self._create(root, config, "feature_1")
+
+            self.assertEqual(warnings, [])
+            self.assertFalse(os.path.exists(os.path.join(new_dir, "README.md")))
+            self.assertEqual(_read(os.path.join(new_dir, "RENAMED.md")), "hello\n")
+
+    def test_symlink_is_reproduced_as_symlink(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, config = _make_subtree_repo(tmp)
+            src = os.path.join(root, "worktrees", "master")
+            os.symlink("README.md", os.path.join(src, "link.md"))
+
+            new_dir, warnings, _ = self._create(root, config, "feature_1")
+
+            self.assertEqual(warnings, [])
+            link = os.path.join(new_dir, "link.md")
+            self.assertTrue(os.path.islink(link))
+            self.assertEqual(os.readlink(link), "README.md")
+
+    def test_carried_untracked_file_gets_path_rewrite(self):
+        """R030024.6 / R030023.1 — copied files join the rewrite candidate set."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root, config = _make_subtree_repo(tmp)
+            src = os.path.join(root, "worktrees", "master")
+            _write(os.path.join(src, "notes.md"), "see {}/docs\n".format(src))
+            _write(os.path.join(src, "notes.bin"), "see {}/docs\n".format(src))
+
+            new_dir, warnings, _ = self._create(root, config, "feature_1")
+
+            self.assertEqual(warnings, [])
+            self.assertEqual(_read(os.path.join(new_dir, "notes.md")), "see {}/docs\n".format(new_dir))
+            # Non-rewritable extension is copied verbatim.
+            self.assertEqual(_read(os.path.join(new_dir, "notes.bin")), "see {}/docs\n".format(src))
+            # Source file is untouched.
+            self.assertEqual(_read(os.path.join(src, "notes.md")), "see {}/docs\n".format(src))
+
+    def test_existing_branch_case_still_carries_and_source_wins(self):
+        """R030014 + R030024 — applies even when the new worktree sits on another commit."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root, config = _make_subtree_repo(tmp)
+            src = os.path.join(root, "worktrees", "master")
+            _git(src, "checkout", "-q", "-b", "existing")
+            _write(os.path.join(src, "README.md"), "on existing\n")
+            _git(src, "commit", "-q", "-am", "existing commit")
+            _git(src, "checkout", "-q", "master")
+            _write(os.path.join(src, "README.md"), "dirty on master\n")
+
+            new_dir, warnings, _ = self._create(root, config, "existing")
+
+            self.assertEqual(warnings, [])
+            self.assertEqual(_git(new_dir, "branch", "--show-current").strip(), "existing")
+            self.assertEqual(_read(os.path.join(new_dir, "README.md")), "dirty on master\n")
+
+    def test_embedded_repository_is_skipped_silently(self):
+        """R010004 / R030024.2 — a directory entry (nested repo) is not copied."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root, config = _make_subtree_repo(tmp)
+            src = os.path.join(root, "worktrees", "master")
+            _init_git_repo(os.path.join(src, "embedded"))
+
+            new_dir, warnings, carried = self._create(root, config, "feature_1")
+
+            self.assertEqual(warnings, [])
+            self.assertFalse(os.path.exists(os.path.join(new_dir, "embedded")))
+            self.assertEqual(carried, [0])
+
+    def test_clean_source_reports_zero(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, config = _make_subtree_repo(tmp)
+            _, warnings, carried = self._create(root, config, "feature_1")
+            self.assertEqual(warnings, [])
+            self.assertEqual(carried, [0])
