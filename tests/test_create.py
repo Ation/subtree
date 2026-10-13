@@ -1582,7 +1582,7 @@ class TestCopyUncommittedChangesSetting(unittest.TestCase):
             del config["settings"]["copy_uncommitted_changes"]
             subtree._write_json(os.path.join(root, subtree.CONFIG_FILENAME), config)
             loaded = subtree._read_config(root)
-            self.assertFalse(subtree._get_copy_uncommitted_changes(loaded))
+            self.assertTrue(subtree._get_copy_uncommitted_changes(loaded))
 
     def test_write_config_fills_absent_keys_and_keeps_present_ones(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1597,7 +1597,7 @@ class TestCopyUncommittedChangesSetting(unittest.TestCase):
                     "copy_directories": [".venv"],
                     "custom": 1,
                     "protected_directories": [],
-                    "copy_uncommitted_changes": False,
+                    "copy_uncommitted_changes": True,
                 },
             )
 
@@ -1620,7 +1620,7 @@ class TestCopyUncommittedChangesSetting(unittest.TestCase):
             TestDoCreate._call_create(TestDoCreate(), root, config, "master", "feature_1")
             with open(os.path.join(root, subtree.CONFIG_FILENAME)) as f:
                 written = json.load(f)
-            self.assertEqual(written["settings"]["copy_uncommitted_changes"], False)
+            self.assertEqual(written["settings"]["copy_uncommitted_changes"], True)
             self.assertEqual(written["settings"]["copy_directories"], [])
 
 

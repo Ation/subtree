@@ -225,6 +225,6 @@ class TestInitSettingsDefaults(unittest.TestCase):
                 {
                     "copy_directories": [],
                     "protected_directories": [],
-                    "copy_uncommitted_changes": False,
+                    "copy_uncommitted_changes": True,
                 },
             )

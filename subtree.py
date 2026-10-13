@@ -23,7 +23,7 @@ _INVALID_REPO_NAME_RE = re.compile(r"[\\/]|[\x00-\x1f]")
 SETTINGS_DEFAULTS = (
     ("copy_directories", lambda: []),
     ("protected_directories", lambda: []),
-    ("copy_uncommitted_changes", lambda: False),
+    ("copy_uncommitted_changes", lambda: True),
 )
 _COPY_GLOB_MAGIC = re.compile(r"[*?\[]")
 
@@ -289,9 +289,9 @@ def _get_protected_directories(config):
 
 
 def _get_copy_uncommitted_changes(config):
-    """R030024. Return `settings.copy_uncommitted_changes`, or False if absent."""
+    """R030024. Return `settings.copy_uncommitted_changes`, or True if absent."""
     settings = config.get("settings") or {}
-    return bool(settings.get("copy_uncommitted_changes", False))
+    return bool(settings.get("copy_uncommitted_changes", True))
 
 
 def _is_gitignored(worktree_dir, relpath):

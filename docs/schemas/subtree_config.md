@@ -13,7 +13,7 @@ The [Subtree config file](../glossary.md#subtree-config-file) lives at the [root
     "settings": {
         "copy_directories": [".venv", ".idea"],
         "protected_directories": [".scratch"],
-        "copy_uncommitted_changes": false
+        "copy_uncommitted_changes": true
     },
     "worktrees": [
         {
@@ -81,8 +81,8 @@ Intended for local-only artefacts such as Python virtualenvs (`.venv`), IDE cach
 
 [Protected directories](../glossary.md#protected-directory): directory paths (relative to a worktree's root) that block [`remove`](../requirements.md#6-remove-operation) while non-empty ([R060018](../requirements.md#6-remove-operation)). Entries follow the same path rules as `settings.copy_directories`, but no glob expansion is performed. An absent key or empty array means no directory is protected.
 
-### `settings.copy_uncommitted_changes` *(boolean, optional, default `false`)*
+### `settings.copy_uncommitted_changes` *(boolean, optional, default `true`)*
 
-When `true`, [`create`](../requirements.md#3-create-operation) carries the [source worktree](../glossary.md#source-worktree)'s [uncommitted changes](../glossary.md#uncommitted-change) into the new worktree before the path rewrite runs ([R030024](../requirements.md#3-create-operation)): modified, staged, renamed, and untracked files are copied as working-tree content, and files deleted in the source are deleted in the new worktree. Everything arrives unstaged. Gitignored files are never part of this set (use `settings.copy_directories` for those) and submodules are ignored ([R010004](../requirements.md#1-restrictions-and-general-requirements)).
+When `true` (the default), [`create`](../requirements.md#3-create-operation) carries the [source worktree](../glossary.md#source-worktree)'s [uncommitted changes](../glossary.md#uncommitted-change) into the new worktree before the path rewrite runs ([R030024](../requirements.md#3-create-operation)): modified, staged, renamed, and untracked files are copied as working-tree content, and files deleted in the source are deleted in the new worktree. Everything arrives unstaged. Set the key to `false` to opt out. Gitignored files are never part of this set (use `settings.copy_directories` for those) and submodules are ignored ([R010004](../requirements.md#1-restrictions-and-general-requirements)).
 
 The key has no effect on [`open`](../requirements.md#4-open-operation) ([R040024](../requirements.md#4-open-operation)). A present value that is not a JSON boolean is a schema error and aborts the operation ([R030004](../requirements.md#3-create-operation)).
